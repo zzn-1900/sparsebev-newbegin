@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.runner import force_fp32
 from mmdet.core import multi_apply, reduce_mean
 from mmdet.models import HEADS
@@ -8,6 +9,7 @@ from mmdet.models.dense_heads import DETRHead
 from mmdet3d.core.bbox.coders import build_bbox_coder
 from mmdet3d.core.bbox.structures.lidar_box3d import LiDARInstance3DBoxes
 from .bbox.utils import normalize_bbox, encode_bbox
+from .proto_query import QueryPrototypeBank
 from .utils import VERSION
 
 
@@ -19,6 +21,7 @@ class SparseBEVHead(DETRHead):
                  in_channels,
                  query_denoising=True,
                  query_denoising_groups=10,
+                 proto_query=None,
                  bbox_coder=None,
                  code_size=10,
                  code_weights=[1.0] * 10,
@@ -45,6 +48,30 @@ class SparseBEVHead(DETRHead):
         self.dn_weight = 1.0
         self.dn_bbox_noise_scale = 0.5
         self.dn_label_noise_scale = 0.5
+
+        self.proto_query = {} if proto_query is None else dict(proto_query)
+        self.proto_enabled = bool(self.proto_query.get('enabled', False))
+        self.proto_use_layers = ()
+        self.proto_min_count = int(self.proto_query.get('min_proto_count', 32))
+        self.proto_temperature = float(self.proto_query.get('temperature', 0.07))
+        self.proto_loss_weight = float(self.proto_query.get('lambda_proto', 0.1))
+        self.prototype_bank = None
+
+        if self.proto_enabled:
+            decoder = self.transformer.decoder
+            decoder.configure_proto_query(self.proto_query)
+
+            use_layers = self.proto_query.get('use_layers')
+            if use_layers is None:
+                use_layers = list(range(max(0, decoder.num_layers - 2), decoder.num_layers))
+            self.proto_use_layers = tuple(sorted(set(use_layers)))
+
+            self.prototype_bank = QueryPrototypeBank(
+                num_layers=decoder.num_layers,
+                num_classes=self.num_classes,
+                embed_dims=self.embed_dims,
+                momentum=float(self.proto_query.get('bank_momentum', 0.99)),
+            )
 
     def _init_layers(self):
         self.init_query_bbox = nn.Embedding(self.num_query, 10)  # (x, y, z, w, l, h, sin, cos, vx, vy)
@@ -74,12 +101,20 @@ class SparseBEVHead(DETRHead):
         B = mlvl_feats[0].shape[0]
         query_bbox, query_feat, attn_mask, mask_dict = self.prepare_for_dn_input(B, query_bbox, self.label_enc, img_metas)
 
-        cls_scores, bbox_preds = self.transformer(
+        prototype_bank = None if self.prototype_bank is None else self.prototype_bank.prototype_bank
+        prototype_count = None if self.prototype_bank is None else self.prototype_bank.prototype_count
+        dn_pad_size = 0 if mask_dict is None else mask_dict['pad_size']
+
+        cls_scores, bbox_preds, all_query_feats = self.transformer(
             query_bbox,
             query_feat,
             mlvl_feats,
             attn_mask=attn_mask,
             img_metas=img_metas,
+            prototype_bank=prototype_bank,
+            prototype_count=prototype_count,
+            prototype_min_count=self.proto_min_count,
+            dn_pad_size=dn_pad_size,
         )
 
         bbox_preds[..., 0] = bbox_preds[..., 0] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
@@ -98,10 +133,12 @@ class SparseBEVHead(DETRHead):
             output_known_bbox_preds = bbox_preds[:, :, :mask_dict['pad_size'], :]
             output_cls_scores = cls_scores[:, :, mask_dict['pad_size']:, :]
             output_bbox_preds = bbox_preds[:, :, mask_dict['pad_size']:, :]
+            output_query_feats = all_query_feats[:, :, mask_dict['pad_size']:, :]
             mask_dict['output_known_lbs_bboxes'] = (output_known_cls_scores, output_known_bbox_preds)
             outs = {
                 'all_cls_scores': output_cls_scores,
                 'all_bbox_preds': output_bbox_preds,
+                'all_query_feats': output_query_feats,
                 'enc_cls_scores': None,
                 'enc_bbox_preds': None, 
                 'dn_mask_dict': mask_dict,
@@ -110,6 +147,7 @@ class SparseBEVHead(DETRHead):
             outs = {
                 'all_cls_scores': cls_scores,
                 'all_bbox_preds': bbox_preds,
+                'all_query_feats': all_query_feats,
                 'enc_cls_scores': None,
                 'enc_bbox_preds': None, 
             }
@@ -344,7 +382,8 @@ class SparseBEVHead(DETRHead):
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list,
-                bbox_weights_list, num_total_pos, num_total_neg)
+                bbox_weights_list, num_total_pos, num_total_neg,
+                pos_inds_list, neg_inds_list)
 
     def loss_single(self,
                     cls_scores,
@@ -358,7 +397,7 @@ class SparseBEVHead(DETRHead):
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                 gt_bboxes_list, gt_labels_list, gt_bboxes_ignore_list)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
-         num_total_pos, num_total_neg) = cls_reg_targets
+         num_total_pos, num_total_neg, _, _) = cls_reg_targets
 
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
@@ -401,6 +440,108 @@ class SparseBEVHead(DETRHead):
         
         return loss_cls, loss_bbox
 
+    def collect_positive_queries(self, query_feats, labels_list, pos_inds_list):
+        pos_feats = []
+        pos_labels = []
+
+        for img_idx, pos_inds in enumerate(pos_inds_list):
+            if pos_inds.numel() == 0:
+                continue
+            pos_feats.append(query_feats[img_idx, pos_inds])
+            pos_labels.append(labels_list[img_idx][pos_inds])
+
+        if len(pos_feats) == 0:
+            return (
+                query_feats.new_zeros((0, query_feats.size(-1))),
+                query_feats.new_zeros((0,), dtype=torch.long),
+            )
+
+        return torch.cat(pos_feats, dim=0), torch.cat(pos_labels, dim=0)
+
+    def get_layer_target_info(self,
+                              cls_scores,
+                              bbox_preds,
+                              gt_bboxes_list,
+                              gt_labels_list,
+                              gt_bboxes_ignore=None):
+        num_imgs = cls_scores.size(0)
+        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
+        bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
+        return self.get_targets(
+            cls_scores_list,
+            bbox_preds_list,
+            gt_bboxes_list,
+            gt_labels_list,
+            gt_bboxes_ignore,
+        )
+
+    def calc_prototype_loss(self,
+                            all_query_feats,
+                            all_cls_scores,
+                            all_bbox_preds,
+                            gt_bboxes_list,
+                            gt_labels_list,
+                            gt_bboxes_ignore=None):
+        zero = all_query_feats.sum() * 0.0
+        if not self.proto_enabled or self.prototype_bank is None:
+            return zero, []
+
+        loss_list = []
+        bank_updates = []
+        num_layers = all_query_feats.shape[0]
+
+        for layer_idx in self.proto_use_layers:
+            if layer_idx < 0 or layer_idx >= num_layers:
+                continue
+
+            target_info = self.get_layer_target_info(
+                all_cls_scores[layer_idx],
+                all_bbox_preds[layer_idx],
+                gt_bboxes_list,
+                gt_labels_list,
+                gt_bboxes_ignore,
+            )
+            (labels_list, _, _, _,
+             _, _, pos_inds_list, _) = target_info
+
+            pos_feats, pos_labels = self.collect_positive_queries(
+                all_query_feats[layer_idx],
+                labels_list,
+                pos_inds_list,
+            )
+            bank_updates.append((layer_idx, pos_feats.detach(), pos_labels.detach()))
+
+            if self.proto_loss_weight <= 0 or pos_feats.numel() == 0:
+                continue
+
+            valid_mask = self.prototype_bank.get_valid_mask(layer_idx, self.proto_min_count)
+            if not torch.any(valid_mask):
+                continue
+
+            sample_mask = valid_mask[pos_labels]
+            if not torch.any(sample_mask):
+                continue
+
+            pos_feats = F.normalize(pos_feats[sample_mask].float(), dim=-1, eps=1e-6)
+            pos_labels = pos_labels[sample_mask]
+            bank = self.prototype_bank.get_normalized_bank(layer_idx).float()
+            logits = torch.matmul(pos_feats, bank.transpose(0, 1))
+            logits = logits / self.proto_temperature
+            logits[:, ~valid_mask] = -1e4
+            loss_list.append(F.cross_entropy(logits, pos_labels))
+
+        if len(loss_list) == 0:
+            return zero, bank_updates
+        return sum(loss_list) / len(loss_list), bank_updates
+
+    @torch.no_grad()
+    def update_prototype_bank(self, bank_updates):
+        if not self.proto_enabled or self.prototype_bank is None:
+            return
+
+        for layer_idx, feats, labels in bank_updates:
+            self.prototype_bank.update(layer_idx, feats, labels)
+
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              gt_bboxes_list,
@@ -413,6 +554,7 @@ class SparseBEVHead(DETRHead):
 
         all_cls_scores = preds_dicts['all_cls_scores']
         all_bbox_preds = preds_dicts['all_bbox_preds']
+        all_query_feats = preds_dicts.get('all_query_feats', None)
         enc_cls_scores = preds_dicts['enc_cls_scores']
         enc_bbox_preds = preds_dicts['enc_bbox_preds']
 
@@ -446,6 +588,19 @@ class SparseBEVHead(DETRHead):
 
         if 'dn_mask_dict' in preds_dicts and preds_dicts['dn_mask_dict'] is not None:
             loss_dict = self.calc_dn_loss(loss_dict, preds_dicts, num_dec_layers)
+
+        if all_query_feats is not None:
+            loss_proto, bank_updates = self.calc_prototype_loss(
+                all_query_feats,
+                all_cls_scores,
+                all_bbox_preds,
+                gt_bboxes_list,
+                gt_labels_list,
+                gt_bboxes_ignore,
+            )
+            if self.proto_enabled and self.proto_loss_weight > 0:
+                loss_dict['loss_proto'] = self.proto_loss_weight * loss_proto
+            self.update_prototype_bank(bank_updates)
 
         # loss from the last decoder layer
         loss_dict['loss_cls'] = losses_cls[-1]
