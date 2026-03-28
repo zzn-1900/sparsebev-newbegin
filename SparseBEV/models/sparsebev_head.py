@@ -9,6 +9,7 @@ from mmdet3d.core.bbox.coders import build_bbox_coder
 from mmdet3d.core.bbox.structures.lidar_box3d import LiDARInstance3DBoxes
 from .bbox.utils import normalize_bbox, encode_bbox
 from .utils import VERSION
+from .corrbev_prototype import OnlinePrototypeGenerator
 
 
 @HEADS.register_module()
@@ -24,6 +25,7 @@ class SparseBEVHead(DETRHead):
                  code_weights=[1.0] * 10,
                  train_cfg=dict(),
                  test_cfg=dict(max_per_img=100),
+                 corrbev=None,
                  **kwargs):
         self.code_size = code_size
         self.code_weights = code_weights
@@ -33,6 +35,7 @@ class SparseBEVHead(DETRHead):
         self.test_cfg = test_cfg
         self.fp16_enabled = False
         self.embed_dims = in_channels
+        self.corrbev_cfg = corrbev
 
         super(SparseBEVHead, self).__init__(num_classes, in_channels, train_cfg=train_cfg, test_cfg=test_cfg, **kwargs)
 
@@ -45,6 +48,20 @@ class SparseBEVHead(DETRHead):
         self.dn_weight = 1.0
         self.dn_bbox_noise_scale = 0.5
         self.dn_label_noise_scale = 0.5
+
+        # CorrBEV在线原型模块
+        self.corrbev_enabled = corrbev is not None and corrbev.get('enable', True)
+        if self.corrbev_enabled:
+            self.prototype_gen = OnlinePrototypeGenerator(
+                num_classes=num_classes,
+                num_sub_protos=corrbev.get('num_sub_protos', 4),
+                embed_dims=in_channels,
+                corr_dims=corrbev.get('corr_dims', 64),
+                ema_momentum=corrbev.get('ema_momentum', 0.999),
+                contrastive_weight=corrbev.get('contrastive_weight', 0.5),
+                buffer_size=corrbev.get('buffer_size', 128),
+                recalib_interval=corrbev.get('recalib_interval', 500),
+            )
 
     def _init_layers(self):
         self.init_query_bbox = nn.Embedding(self.num_query, 10)  # (x, y, z, w, l, h, sin, cos, vx, vy)
@@ -70,6 +87,11 @@ class SparseBEVHead(DETRHead):
         query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
         #query_bbox[..., :3] = query_bbox[..., :3].sigmoid()
 
+        # CorrBEV: 计算correlation特征
+        corr_feats = None
+        if self.corrbev_enabled:
+            corr_feats = self._compute_corr_feats(mlvl_feats)
+
         # query denoising
         B = mlvl_feats[0].shape[0]
         query_bbox, query_feat, attn_mask, mask_dict = self.prepare_for_dn_input(B, query_bbox, self.label_enc, img_metas)
@@ -80,6 +102,7 @@ class SparseBEVHead(DETRHead):
             mlvl_feats,
             attn_mask=attn_mask,
             img_metas=img_metas,
+            corr_feats=corr_feats,
         )
 
         bbox_preds[..., 0] = bbox_preds[..., 0] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
@@ -457,6 +480,14 @@ class SparseBEVHead(DETRHead):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
+
+        # CorrBEV: 对比损失 + EMA更新视觉原型
+        if self.corrbev_enabled:
+            loss_dict = self._corrbev_loss_and_update(
+                loss_dict, all_cls_scores[-1], all_bbox_preds[-1],
+                gt_bboxes_list, gt_labels_list
+            )
+
         return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))
@@ -480,3 +511,82 @@ class SparseBEVHead(DETRHead):
             labels = preds['labels']
             ret_list.append([bboxes, scores, labels])
         return ret_list
+
+    def _compute_corr_feats(self, mlvl_feats):
+        """对每层FPN特征计算correlation特征
+
+        Args:
+            mlvl_feats: list of (B, TN, GC, H, W)
+
+        Returns:
+            corr_feats: list of correlation特征，与mlvl_feats形状对齐
+        """
+        corr_feats = []
+        for feat in mlvl_feats:
+            B, TN, GC, H, W = feat.shape
+            G = 4
+            C = GC // G  # C=64 per group
+
+            # 对每个group分别做correlation，然后拼接
+            # feat: (B, TN, G*C, H, W) → (B*TN, G, C, H, W)
+            feat_grouped = feat.reshape(B * TN, G, C, H, W)
+
+            corr_groups = []
+            for g in range(G):
+                feat_g = feat_grouped[:, g, :, :, :]  # (B*TN, C, H, W)
+                corr_g = self.prototype_gen.compute_correlation(feat_g)  # (B*TN, corr_dims, H, W)
+                corr_groups.append(corr_g)
+
+            # 拼接所有group: (B*TN, G*corr_dims, H, W)
+            corr = torch.cat(corr_groups, dim=1)
+            corr_dims_total = corr.shape[1]
+            corr = corr.reshape(B, TN, corr_dims_total, H, W)
+
+            corr_feats.append(corr)
+        return corr_feats
+
+    def _corrbev_loss_and_update(self, loss_dict, cls_scores, bbox_preds,
+                                  gt_bboxes_list, gt_labels_list):
+        """计算对比损失并EMA更新视觉原型
+
+        利用最后一层decoder的匈牙利匹配结果获取正样本。
+        """
+        # 获取最后一层的query特征（从transformer中缓存）
+        query_feat = self.transformer.decoder.last_query_feat  # (B, Q, D)
+
+        num_imgs = cls_scores.size(0)
+        all_pos_feats = []
+        all_pos_labels = []
+
+        for i in range(num_imgs):
+            # 复用已有的匹配逻辑
+            assign_result = self.assigner.assign(
+                bbox_preds[i], cls_scores[i],
+                gt_bboxes_list[i], gt_labels_list[i],
+                None, self.code_weights, True
+            )
+            sampling_result = self.sampler.sample(assign_result, bbox_preds[i], gt_bboxes_list[i])
+            pos_inds = sampling_result.pos_inds
+
+            if len(pos_inds) > 0:
+                pos_feat = query_feat[i, pos_inds].detach()  # (Npos, D)
+                pos_label = gt_labels_list[i][sampling_result.pos_assigned_gt_inds]
+                all_pos_feats.append(pos_feat)
+                all_pos_labels.append(pos_label)
+
+        if len(all_pos_feats) > 0:
+            all_pos_feats = torch.cat(all_pos_feats, dim=0)
+            all_pos_labels = torch.cat(all_pos_labels, dim=0)
+
+            # 对比损失
+            loss_dict['loss_contrastive'] = self.prototype_gen.contrastive_loss(
+                all_pos_feats, all_pos_labels
+            )
+
+            # EMA更新视觉原型
+            if self.training:
+                self.prototype_gen.update_visual_prototypes(all_pos_feats, all_pos_labels)
+        else:
+            loss_dict['loss_contrastive'] = cls_scores.sum() * 0.0
+
+        return loss_dict
