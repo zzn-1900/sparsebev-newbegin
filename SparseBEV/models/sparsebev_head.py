@@ -56,7 +56,7 @@ class SparseBEVHead(DETRHead):
                 num_classes=num_classes,
                 num_sub_protos=corrbev.get('num_sub_protos', 4),
                 embed_dims=in_channels,
-                corr_dims=corrbev.get('corr_dims', 64),
+                num_heads=corrbev.get('num_heads', 8),
                 ema_momentum=corrbev.get('ema_momentum', 0.999),
                 contrastive_weight=corrbev.get('contrastive_weight', 0.5),
                 buffer_size=corrbev.get('buffer_size', 128),
@@ -85,12 +85,6 @@ class SparseBEVHead(DETRHead):
 
     def forward(self, mlvl_feats, img_metas):
         query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
-        #query_bbox[..., :3] = query_bbox[..., :3].sigmoid()
-
-        # CorrBEV: 计算correlation特征
-        corr_feats = None
-        if self.corrbev_enabled:
-            corr_feats = self._compute_corr_feats(mlvl_feats)
 
         # query denoising
         B = mlvl_feats[0].shape[0]
@@ -102,7 +96,7 @@ class SparseBEVHead(DETRHead):
             mlvl_feats,
             attn_mask=attn_mask,
             img_metas=img_metas,
-            corr_feats=corr_feats,
+            prototype_gen=self.prototype_gen if self.corrbev_enabled else None,
         )
 
         bbox_preds[..., 0] = bbox_preds[..., 0] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
@@ -511,39 +505,6 @@ class SparseBEVHead(DETRHead):
             labels = preds['labels']
             ret_list.append([bboxes, scores, labels])
         return ret_list
-
-    def _compute_corr_feats(self, mlvl_feats):
-        """对每层FPN特征计算correlation特征
-
-        Args:
-            mlvl_feats: list of (B, TN, GC, H, W)
-
-        Returns:
-            corr_feats: list of correlation特征，与mlvl_feats形状对齐
-        """
-        corr_feats = []
-        for feat in mlvl_feats:
-            B, TN, GC, H, W = feat.shape
-            G = 4
-            C = GC // G  # C=64 per group
-
-            # 对每个group分别做correlation，然后拼接
-            # feat: (B, TN, G*C, H, W) → (B*TN, G, C, H, W)
-            feat_grouped = feat.reshape(B * TN, G, C, H, W)
-
-            corr_groups = []
-            for g in range(G):
-                feat_g = feat_grouped[:, g, :, :, :]  # (B*TN, C, H, W)
-                corr_g = self.prototype_gen.compute_correlation(feat_g)  # (B*TN, corr_dims, H, W)
-                corr_groups.append(corr_g)
-
-            # 拼接所有group: (B*TN, G*corr_dims, H, W)
-            corr = torch.cat(corr_groups, dim=1)
-            corr_dims_total = corr.shape[1]
-            corr = corr.reshape(B, TN, corr_dims_total, H, W)
-
-            corr_feats.append(corr)
-        return corr_feats
 
     def _corrbev_loss_and_update(self, loss_dict, cls_scores, bbox_preds,
                                   gt_bboxes_list, gt_labels_list):

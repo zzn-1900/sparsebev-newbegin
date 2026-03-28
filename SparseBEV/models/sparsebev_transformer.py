@@ -15,7 +15,7 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], corr_dims=0, init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,14 +23,14 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range, corr_dims=corr_dims)
+        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
 
     @torch.no_grad()
     def init_weights(self):
         self.decoder.init_weights()
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, corr_feats=None):
-        cls_scores, bbox_preds = self.decoder(query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, corr_feats=corr_feats)
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prototype_gen=None):
+        cls_scores, bbox_preds = self.decoder(query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prototype_gen=prototype_gen)
 
         cls_scores = torch.nan_to_num(cls_scores)
         bbox_preds = torch.nan_to_num(bbox_preds)
@@ -39,7 +39,7 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], corr_dims=0, init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
@@ -47,14 +47,14 @@ class SparseBEVTransformerDecoder(BaseModule):
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range, corr_dims=corr_dims
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
         )
 
     @torch.no_grad()
     def init_weights(self):
         self.decoder_layer.init_weights()
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, corr_feats=None):
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prototype_gen=None):
         cls_scores, bbox_preds = [], []
 
         # calculate time difference according to timestamps
@@ -85,31 +85,12 @@ class SparseBEVTransformerDecoder(BaseModule):
 
             mlvl_feats[lvl] = feat.contiguous()
 
-        # group correlation features the same way
-        mlvl_corr_feats = None
-        if corr_feats is not None:
-            mlvl_corr_feats = []
-            for lvl, corr in enumerate(corr_feats):
-                B_c, TN_c, GCc, H_c, W_c = corr.shape
-                N_c, T_c, G_c = 6, TN_c // 6, 4
-                Cc = GCc // G_c
-                corr = corr.reshape(B_c, T_c, N_c, G_c, Cc, H_c, W_c)
-
-                if MSMV_CUDA:
-                    corr = corr.permute(0, 1, 3, 2, 5, 6, 4)
-                    corr = corr.reshape(B_c*T_c*G_c, N_c, H_c, W_c, Cc)
-                else:
-                    corr = corr.permute(0, 1, 3, 4, 2, 5, 6)
-                    corr = corr.reshape(B_c*T_c*G_c, Cc, N_c, H_c, W_c)
-
-                mlvl_corr_feats.append(corr.contiguous())
-
         for i in range(self.num_layers):
             DUMP.stage_count = i
 
             query_feat, cls_score, bbox_pred = self.decoder_layer(
                 query_bbox, query_feat, mlvl_feats, attn_mask, img_metas,
-                corr_feats=mlvl_corr_feats,
+                prototype_gen=prototype_gen,
             )
             query_bbox = bbox_pred.clone().detach()
 
@@ -126,7 +107,7 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], corr_dims=0, init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -144,7 +125,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         )
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
-        self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range, corr_dims=corr_dims)
+        self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -172,7 +153,6 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         self.self_attn.init_weights()
         self.sampling.init_weights()
         self.mixing.init_weights()
-
         bias_init = bias_init_with_prob(0.01)
         nn.init.constant_(self.cls_branch[-1].bias, bias_init)
 
@@ -180,28 +160,27 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         xyz = inverse_sigmoid(bbox_proposal[..., 0:3])
         xyz_delta = bbox_delta[..., 0:3]
         xyz_new = torch.sigmoid(xyz_delta + xyz)
-
         return torch.cat([xyz_new, bbox_delta[..., 3:]], dim=-1)
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, corr_feats=None):
-        """
-        query_bbox: [B, Q, 10] [cx, cy, cz, w, h, d, rot.sin, rot.cos, vx, vy]
-        corr_feats: list of correlation特征，与mlvl_feats形状对齐（可选）
-        """
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prototype_gen=None):
         query_pos = self.position_encoder(query_bbox[..., :3])
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas, corr_feats=corr_feats)
+
+        # 原型增强: cross-attend到融合原型（在采样之前，让query带着类别先验去采样）
+        if prototype_gen is not None:
+            query_feat = prototype_gen.enhance_query(query_feat)
+
+        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
-        cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
-        bbox_pred = self.reg_branch(query_feat)  # [B, Q, code_size]
+        cls_score = self.cls_branch(query_feat)
+        bbox_pred = self.reg_branch(query_feat)
         bbox_pred = self.refine_bbox(query_bbox, bbox_pred)
 
-        # calculate absolute velocity according to time difference
-        time_diff = img_metas[0]['time_diff']  # [B, F]
+        time_diff = img_metas[0]['time_diff']
         if time_diff.shape[1] > 1:
             time_diff = time_diff.clone()
             time_diff[time_diff < 1e-5] = 1.0
@@ -219,11 +198,9 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
 
 class SparseBEVSelfAttention(BaseModule):
-    """Scale-adaptive Self Attention"""
     def __init__(self, embed_dims=256, num_heads=8, dropout=0.1, pc_range=[], init_cfg=None):
         super().__init__(init_cfg)
         self.pc_range = pc_range
-
         self.attention = MultiheadAttention(embed_dims, num_heads, dropout, batch_first=True)
         self.gen_tau = nn.Linear(embed_dims, num_heads)
 
@@ -233,23 +210,15 @@ class SparseBEVSelfAttention(BaseModule):
         nn.init.uniform_(self.gen_tau.bias, 0.0, 2.0)
 
     def inner_forward(self, query_bbox, query_feat, pre_attn_mask):
-        """
-        query_bbox: [B, Q, 10]
-        query_feat: [B, Q, C]
-        """
         dist = self.calc_bbox_dists(query_bbox)
-        tau = self.gen_tau(query_feat)  # [B, Q, 8]
-
+        tau = self.gen_tau(query_feat)
         if DUMP.enabled:
             torch.save(tau.cpu(), '{}/sasa_tau_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
-
-        tau = tau.permute(0, 2, 1)  # [B, 8, Q]
-        attn_mask = dist[:, None, :, :] * tau[..., None]  # [B, 8, Q, Q]
-
-        if pre_attn_mask is not None:  # for query denoising
+        tau = tau.permute(0, 2, 1)
+        attn_mask = dist[:, None, :, :] * tau[..., None]
+        if pre_attn_mask is not None:
             attn_mask[:, :, pre_attn_mask] = float('-inf')
-
-        attn_mask = attn_mask.flatten(0, 1)  # [Bx8, Q, Q]
+        attn_mask = attn_mask.flatten(0, 1)
         return self.attention(query_feat, attn_mask=attn_mask)
 
     def forward(self, query_bbox, query_feat, pre_attn_mask):
@@ -260,117 +229,72 @@ class SparseBEVSelfAttention(BaseModule):
 
     @torch.no_grad()
     def calc_bbox_dists(self, bboxes):
-        centers = decode_bbox(bboxes, self.pc_range)[..., :2]  # [B, Q, 2]
-
+        centers = decode_bbox(bboxes, self.pc_range)[..., :2]
         dist = []
         for b in range(centers.shape[0]):
             dist_b = torch.norm(centers[b].reshape(-1, 1, 2) - centers[b].reshape(1, -1, 2), dim=-1)
             dist.append(dist_b[None, ...])
-
-        dist = torch.cat(dist, dim=0)  # [B, Q, Q]
-        dist = -dist
-
-        return dist
+        dist = torch.cat(dist, dim=0)
+        return -dist
 
 
 class SparseBEVSampling(BaseModule):
-    """Adaptive Spatio-temporal Sampling with optional dual-path correlation"""
-    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], corr_dims=0, init_cfg=None):
+    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], init_cfg=None):
         super().__init__(init_cfg)
-
         self.num_frames = num_frames
         self.num_points = num_points
         self.num_groups = num_groups
         self.num_levels = num_levels
         self.pc_range = pc_range
-        self.corr_dims = corr_dims
-
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
         self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
-
-        # 双路径融合投影: 在__init__中创建，避免DDP问题
-        if corr_dims > 0:
-            feat_per_group = embed_dims // num_groups
-            self.corr_fusion_proj = nn.Linear(feat_per_group + corr_dims, feat_per_group)
-        else:
-            self.corr_fusion_proj = None
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
 
-    def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas, corr_feats=None):
-        '''
-        query_bbox: [B, Q, 10]
-        query_feat: [B, Q, C]
-        corr_feats: list of correlation特征（可选）
-        '''
+    def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         B, Q = query_bbox.shape[:2]
         image_h, image_w, _ = img_metas[0]['img_shape'][0]
 
-        # sampling offset of all frames
         sampling_offset = self.sampling_offset(query_feat)
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
-        sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
+        sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
-        # warp sample points based on velocity
-        time_diff = img_metas[0]['time_diff']  # [B, F]
-        time_diff = time_diff[:, None, :, None]  # [B, 1, F, 1]
-        vel = query_bbox[..., 8:].detach()  # [B, Q, 2]
-        vel = vel[:, :, None, :]  # [B, Q, 1, 2]
-        dist = vel * time_diff  # [B, Q, F, 2]
-        dist = dist[:, :, :, None, None, :]  # [B, Q, F, 1, 1, 2]
+        time_diff = img_metas[0]['time_diff']
+        time_diff = time_diff[:, None, :, None]
+        vel = query_bbox[..., 8:].detach()
+        vel = vel[:, :, None, :]
+        dist = vel * time_diff
+        dist = dist[:, :, :, None, None, :]
         sampling_points = torch.cat([
             sampling_points[..., 0:2] - dist,
             sampling_points[..., 2:3]
         ], dim=-1)
 
-        # scale weights
         scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
         scale_weights = torch.softmax(scale_weights, dim=-1)
         scale_weights = scale_weights.expand(B, Q, self.num_groups, self.num_frames, self.num_points, self.num_levels)
 
-        # sampling from backbone features
         sampled_feats = sampling_4d(
-            sampling_points,
-            mlvl_feats,
-            scale_weights,
-            img_metas[0]['lidar2img'],
-            image_h, image_w
-        )  # [B, Q, G, FP, C]
-
-        # 双路径: 同时从correlation特征采样并融合
-        if corr_feats is not None and self.corr_fusion_proj is not None:
-            corr_sampled = sampling_4d(
-                sampling_points,
-                corr_feats,
-                scale_weights,
-                img_metas[0]['lidar2img'],
-                image_h, image_w
-            )  # [B, Q, G, FP, Cc]
-
-            # 拼接并投影回原始维度
-            sampled_feats = self.corr_fusion_proj(
-                torch.cat([sampled_feats, corr_sampled], dim=-1)
-            )
-
+            sampling_points, mlvl_feats, scale_weights,
+            img_metas[0]['lidar2img'], image_h, image_w
+        )
         return sampled_feats
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, img_metas, corr_feats=None):
+    def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
-            return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, corr_feats, use_reentrant=False)
+            return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
         else:
-            return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas, corr_feats=corr_feats)
+            return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
 
 
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing"""
     def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
         super(AdaptiveMixing, self).__init__()
-
         out_dim = out_dim if out_dim is not None else in_dim
         out_points = out_points if out_points is not None else in_points
         query_dim = query_dim if query_dim is not None else in_dim
@@ -399,11 +323,6 @@ class AdaptiveMixing(nn.Module):
 
     def inner_forward(self, x, query):
         B, Q, G, P, C = x.shape
-        assert G == self.n_groups
-        assert P == self.in_points
-        assert C == self.eff_in_dim
-
-        '''generate mixing parameters'''
         params = self.parameter_generator(query)
         params = params.reshape(B*Q, G, -1)
         out = x.reshape(B*Q, G, P, C)
@@ -412,21 +331,17 @@ class AdaptiveMixing(nn.Module):
         M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
         S = S.reshape(B*Q, G, self.out_points, self.in_points)
 
-        '''adaptive channel mixing'''
         out = torch.matmul(out, M)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''adaptive point mixing'''
-        out = torch.matmul(S, out)  # implicitly transpose and matmul
+        out = torch.matmul(S, out)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''linear transfomation to query dim'''
         out = out.reshape(B, Q, -1)
         out = self.out_proj(out)
         out = query + out
-
         return out
 
     def forward(self, x, query):
