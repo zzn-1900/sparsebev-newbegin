@@ -169,8 +169,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat, sampling_points = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        sampled_feat = self.temporal_gate(sampled_feat, query_feat, sampling_points)
+        sampled_feat, sampling_offsets = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat = self.temporal_gate(sampled_feat, query_feat, sampling_offsets, img_metas[0]['time_diff'])
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -285,6 +285,9 @@ class SparseBEVSampling(BaseModule):
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
+        # base offset per point: [B, Q, G, P, 3]
+        base_offset = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
+
         # warp sample points based on velocity
         time_diff = img_metas[0]['time_diff']  # [B, F]
         time_diff = time_diff[:, None, :, None]  # [B, 1, F, 1]
@@ -296,6 +299,15 @@ class SparseBEVSampling(BaseModule):
             sampling_points[..., 0:2] - dist,
             sampling_points[..., 2:3]
         ], dim=-1)
+
+        # per-frame offset = base_offset + velocity warp
+        # dist: [B, Q, F, 1, 1, 2] → [B, Q, F, G, P, 2]
+        dist_expand = dist.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 2)
+        warp_offset = torch.zeros(B, Q, self.num_frames, self.num_groups, self.num_points, 3,
+                                  device=sampling_offset.device, dtype=sampling_offset.dtype)
+        warp_offset[..., 0:2] = -dist_expand  # velocity warp is subtracted
+        # total offset per frame per point: base + warp
+        total_offset = base_offset[:, :, None, :, :, :] + warp_offset  # [B, Q, F, G, P, 3]
 
         # scale weights
         scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
@@ -311,7 +323,7 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        return sampled_feats, sampling_points
+        return sampled_feats, total_offset
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -339,9 +351,16 @@ class TemporalConfidenceGate(nn.Module):
         self.num_points = num_points
         self.eff_dim = feat_dim // num_groups          # C per group, e.g. 64
 
-        # sampling offset → positional encoding (add to tokens)
+        # sampling offset → spatial positional encoding (add to tokens)
         self.offset_pe = nn.Sequential(
             nn.Linear(3, self.eff_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.eff_dim, self.eff_dim),
+        )
+
+        # time_diff (scalar seconds) → temporal positional encoding (add to tokens)
+        self.temporal_pe = nn.Sequential(
+            nn.Linear(1, self.eff_dim),
             nn.ReLU(inplace=True),
             nn.Linear(self.eff_dim, self.eff_dim),
         )
@@ -372,25 +391,31 @@ class TemporalConfidenceGate(nn.Module):
         nn.init.zeros_(self.score_head[-1].weight)
         nn.init.zeros_(self.score_head[-1].bias)
 
-    def forward(self, sampled_feats, query_feat, sampling_points):
+    def forward(self, sampled_feats, query_feat, sampling_offsets, time_diff):
         """
         Args:
-            sampled_feats:   [B, Q, G, F*P, C]   from sampling_4d
-            query_feat:      [B, Q, feat_dim]     after self-attention
-            sampling_points: [B, Q, F, G, P, 3]   3-D sampling coordinates
+            sampled_feats:    [B, Q, G, F*P, C]   from sampling_4d
+            query_feat:       [B, Q, feat_dim]     after self-attention
+            sampling_offsets: [B, Q, F, G, P, 3]   offsets relative to query center
+            time_diff:        [B, F]               seconds relative to current frame
         Returns:
-            gated_feats:     [B, Q, G, F*P, C]   confidence-weighted features
+            gated_feats:      [B, Q, G, F*P, C]   confidence-weighted features
         """
         B, Q, G, FP, C = sampled_feats.shape
         F, P = self.num_frames, self.num_points
 
-        # --- offset positional encoding (add) ---
-        # sampling_points: [B, Q, F, G, P, 3] → [B, Q, G, F, P, 3]
-        offsets = sampling_points.permute(0, 1, 3, 2, 4, 5).contiguous()
-        ope = self.offset_pe(offsets)                          # [B, Q, G, F, P, C]
-        ope = ope.reshape(B, Q, G, FP, C)
+        # --- spatial positional encoding from offsets ---
+        # [B, Q, F, G, P, 3] → [B, Q, G, F, P, 3]
+        offsets = sampling_offsets.permute(0, 1, 3, 2, 4, 5).contiguous()
+        ope = self.offset_pe(offsets)                           # [B, Q, G, F, P, C]
 
-        tokens = sampled_feats + ope                           # [B, Q, G, FP, C]
+        # --- temporal positional encoding (add) ---
+        # time_diff: [B, F] → [B, 1, 1, F, 1, 1] → broadcast to [B, Q, G, F, P, C]
+        tpe = self.temporal_pe(time_diff[:, :, None])          # [B, F, C]
+        tpe = tpe[:, None, None, :, None, :]                   # [B, 1, 1, F, 1, C]
+
+        tokens = sampled_feats.reshape(B, Q, G, F, P, C) + ope + tpe
+        tokens = tokens.reshape(B, Q, G, FP, C)
 
         # --- query condition (concat) ---
         q_cond = self.query_proj(query_feat)                   # [B, Q, C]
