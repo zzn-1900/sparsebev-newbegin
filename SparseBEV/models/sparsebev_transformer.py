@@ -15,7 +15,8 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[],
+                 temporal_weight_dropout=0.1, temporal_weight_min_decay=0.1, init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +24,12 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(
+            embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size,
+            pc_range=pc_range,
+            temporal_weight_dropout=temporal_weight_dropout,
+            temporal_weight_min_decay=temporal_weight_min_decay,
+        )
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +45,18 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[],
+                 temporal_weight_dropout=0.1, temporal_weight_min_decay=0.1, init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size,
+            pc_range=pc_range,
+            temporal_weight_dropout=temporal_weight_dropout,
+            temporal_weight_min_decay=temporal_weight_min_decay,
         )
 
     @torch.no_grad()
@@ -102,7 +112,8 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[],
+                 temporal_weight_dropout=0.1, temporal_weight_min_decay=0.1, init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -120,7 +131,16 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         )
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
-        self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.sampling = SparseBEVSampling(
+            embed_dims,
+            num_frames=num_frames,
+            num_groups=4,
+            num_points=num_points,
+            num_levels=num_levels,
+            pc_range=pc_range,
+            temporal_weight_dropout=temporal_weight_dropout,
+            temporal_weight_min_decay=temporal_weight_min_decay,
+        )
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -250,7 +270,8 @@ class SparseBEVSelfAttention(BaseModule):
 
 class SparseBEVSampling(BaseModule):
     """Adaptive Spatio-temporal Sampling"""
-    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[],
+                 temporal_weight_dropout=0.1, temporal_weight_min_decay=0.1, init_cfg=None):
         super().__init__(init_cfg)
 
         self.num_frames = num_frames
@@ -258,14 +279,37 @@ class SparseBEVSampling(BaseModule):
         self.num_groups = num_groups
         self.num_levels = num_levels
         self.pc_range = pc_range
+        self.temporal_weight_min_decay = temporal_weight_min_decay
 
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
         self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
+        self.temporal_decay = nn.Linear(embed_dims, num_groups)
+        self.temporal_dropout = nn.Dropout(temporal_weight_dropout)
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+        nn.init.zeros_(self.temporal_decay.weight)
+        nn.init.zeros_(self.temporal_decay.bias)
+
+    def build_temporal_weights(self, query_feat, time_diff):
+        """Generate lightweight query-adaptive frame weights with a recency prior."""
+        B, Q = query_feat.shape[:2]
+        if self.num_frames == 1:
+            return query_feat.new_ones(B, Q, self.num_groups, 1)
+
+        # Use absolute time distance so the same logic also works for past/future sweeps.
+        time_dist = time_diff.abs()
+        time_scale = time_dist.max(dim=-1, keepdim=True)[0].clamp(min=1e-3)
+        time_dist = time_dist / time_scale
+
+        temporal_feat = self.temporal_dropout(query_feat)
+        temporal_decay = F.softplus(self.temporal_decay(temporal_feat)) + self.temporal_weight_min_decay
+        temporal_logits = -temporal_decay[..., None] * time_dist[:, None, None, :]
+        temporal_weights = torch.softmax(temporal_logits, dim=-1)
+
+        return temporal_weights
 
     def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         '''
@@ -284,6 +328,7 @@ class SparseBEVSampling(BaseModule):
 
         # warp sample points based on velocity
         time_diff = img_metas[0]['time_diff']  # [B, F]
+        temporal_weights = self.build_temporal_weights(query_feat, time_diff)
         time_diff = time_diff[:, None, :, None]  # [B, 1, F, 1]
         vel = query_bbox[..., 8:].detach()  # [B, Q, 2]
         vel = vel[:, :, None, :]  # [B, Q, 1, 2]
@@ -298,6 +343,7 @@ class SparseBEVSampling(BaseModule):
         scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
         scale_weights = torch.softmax(scale_weights, dim=-1)
         scale_weights = scale_weights.expand(B, Q, self.num_groups, self.num_frames, self.num_points, self.num_levels)
+        scale_weights = scale_weights * temporal_weights[..., None, None]
 
         # sampling
         sampled_feats = sampling_4d(
