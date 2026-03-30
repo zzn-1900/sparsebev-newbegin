@@ -391,7 +391,7 @@ class TemporalConfidenceGate(nn.Module):
         nn.init.zeros_(self.score_head[-1].weight)
         nn.init.zeros_(self.score_head[-1].bias)
 
-    def forward(self, sampled_feats, query_feat, sampling_offsets, time_diff):
+    def inner_forward(self, sampled_feats, query_feat, sampling_offsets, time_diff):
         """
         Args:
             sampled_feats:    [B, Q, G, F*P, C]   from sampling_4d
@@ -427,7 +427,9 @@ class TemporalConfidenceGate(nn.Module):
         BQG = B * Q * G
         tokens = tokens.reshape(BQG, FP, self.eff_dim * 2)    # [BQG, 32, 2C]
         tokens = self.attn_norm(
-            tokens + self.attn_drop(self.self_attn(tokens, tokens, tokens)[0])
+            # Gate only needs the attended features, not the attention map.
+            # Skipping attention weights avoids materializing a large tensor.
+            tokens + self.attn_drop(self.self_attn(tokens, tokens, tokens, need_weights=False)[0])
         )
 
         # --- per-point score → temporal softmax ---
@@ -437,6 +439,15 @@ class TemporalConfidenceGate(nn.Module):
 
         weights = weights.reshape(B, Q, G, FP, 1)
         return sampled_feats * weights
+
+    def forward(self, sampled_feats, query_feat, sampling_offsets, time_diff):
+        # detach offsets — only used for positional encoding, gradient flows
+        # back to sampling_offset via the main sampling path
+        sampling_offsets = sampling_offsets.detach()
+        if self.training and sampled_feats.requires_grad:
+            return cp(self.inner_forward, sampled_feats, query_feat, sampling_offsets, time_diff, use_reentrant=False)
+        else:
+            return self.inner_forward(sampled_feats, query_feat, sampling_offsets, time_diff)
 
 
 class AdaptiveMixing(nn.Module):
