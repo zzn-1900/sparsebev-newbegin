@@ -27,6 +27,7 @@ num_query = 900
 num_frames = 8
 num_levels = 4
 num_points = 4
+temporal_gate_dropout = 0.1
 
 img_backbone = dict(
     type='ResNet',
@@ -76,7 +77,8 @@ model = dict(
             num_levels=num_levels,
             num_classes=10,
             code_size=10,
-            pc_range=point_cloud_range),
+            pc_range=point_cloud_range,
+            temporal_gate_dropout=temporal_gate_dropout),
         bbox_coder=dict(
             type='NMSFreeCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],

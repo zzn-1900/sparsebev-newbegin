@@ -15,7 +15,7 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], temporal_gate_dropout=0.1, init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +23,7 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range, temporal_gate_dropout=temporal_gate_dropout)
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +39,14 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], temporal_gate_dropout=0.1, init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range, temporal_gate_dropout=temporal_gate_dropout
         )
 
     @torch.no_grad()
@@ -102,7 +102,7 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], temporal_gate_dropout=0.1, init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -121,6 +121,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.temporal_gate = TemporalConfidenceGate(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_heads=4, dropout=temporal_gate_dropout)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -147,6 +148,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
     def init_weights(self):
         self.self_attn.init_weights()
         self.sampling.init_weights()
+        self.temporal_gate.init_weights()
         self.mixing.init_weights()
 
         bias_init = bias_init_with_prob(0.01)
@@ -167,7 +169,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat, sampling_points = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat = self.temporal_gate(sampled_feat, query_feat, sampling_points)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -308,13 +311,107 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        return sampled_feats
+        return sampled_feats, sampling_points
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
             return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
         else:
             return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
+
+
+class TemporalConfidenceGate(nn.Module):
+    """Frame-level confidence gating with transformer-based point interaction.
+
+    For each query, uses a lightweight per-group transformer over all F*P
+    sampling tokens (with offset positional encoding and query conditioning)
+    to produce per-point, per-frame confidence weights.  Weights are
+    softmax-normalised across the temporal dimension so that information is
+    *redistributed* rather than suppressed — background sampling points that
+    look similar across frames get near-uniform weights and are unaffected.
+    """
+
+    def __init__(self, feat_dim, num_frames, num_groups, num_points,
+                 num_heads=4, dropout=0.1):
+        super().__init__()
+        self.num_frames = num_frames
+        self.num_groups = num_groups
+        self.num_points = num_points
+        self.eff_dim = feat_dim // num_groups          # C per group, e.g. 64
+
+        # sampling offset → positional encoding (add to tokens)
+        self.offset_pe = nn.Sequential(
+            nn.Linear(3, self.eff_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.eff_dim, self.eff_dim),
+        )
+
+        # query condition projection (concat with tokens → 2C input)
+        self.query_proj = nn.Linear(feat_dim, self.eff_dim)
+
+        # per-group transformer: seq_len = F*P (e.g. 32), dim = 2*eff_dim
+        attn_dim = self.eff_dim * 2
+        self.input_proj = nn.Linear(attn_dim, attn_dim)
+        self.self_attn = nn.MultiheadAttention(
+            attn_dim, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(attn_dim)
+        self.attn_drop = nn.Dropout(dropout)
+
+        # per-point score head
+        self.score_head = nn.Sequential(
+            nn.Linear(attn_dim, attn_dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(attn_dim // 4, 1),
+        )
+
+    @torch.no_grad()
+    def init_weights(self):
+        # zero-init score head so gate starts near-uniform (softmax → 1/F)
+        nn.init.zeros_(self.score_head[-1].weight)
+        nn.init.zeros_(self.score_head[-1].bias)
+
+    def forward(self, sampled_feats, query_feat, sampling_points):
+        """
+        Args:
+            sampled_feats:   [B, Q, G, F*P, C]   from sampling_4d
+            query_feat:      [B, Q, feat_dim]     after self-attention
+            sampling_points: [B, Q, F, G, P, 3]   3-D sampling coordinates
+        Returns:
+            gated_feats:     [B, Q, G, F*P, C]   confidence-weighted features
+        """
+        B, Q, G, FP, C = sampled_feats.shape
+        F, P = self.num_frames, self.num_points
+
+        # --- offset positional encoding (add) ---
+        # sampling_points: [B, Q, F, G, P, 3] → [B, Q, G, F, P, 3]
+        offsets = sampling_points.permute(0, 1, 3, 2, 4, 5).contiguous()
+        ope = self.offset_pe(offsets)                          # [B, Q, G, F, P, C]
+        ope = ope.reshape(B, Q, G, FP, C)
+
+        tokens = sampled_feats + ope                           # [B, Q, G, FP, C]
+
+        # --- query condition (concat) ---
+        q_cond = self.query_proj(query_feat)                   # [B, Q, C]
+        q_cond = q_cond[:, :, None, None, :].expand(B, Q, G, FP, C)
+        tokens = torch.cat([tokens, q_cond], dim=-1)           # [B, Q, G, FP, 2C]
+
+        # --- per-group transformer self-attention ---
+        tokens = self.input_proj(tokens)
+        BQG = B * Q * G
+        tokens = tokens.reshape(BQG, FP, self.eff_dim * 2)    # [BQG, 32, 2C]
+        tokens = self.attn_norm(
+            tokens + self.attn_drop(self.self_attn(tokens, tokens, tokens)[0])
+        )
+
+        # --- per-point score → temporal softmax ---
+        tokens = tokens.reshape(B, Q, G, F, P, self.eff_dim * 2)
+        scores = self.score_head(tokens)                       # [B, Q, G, F, P, 1]
+        weights = torch.softmax(scores, dim=3) * F            # normalise over F
+
+        weights = weights.reshape(B, Q, G, FP, 1)
+        return sampled_feats * weights
 
 
 class AdaptiveMixing(nn.Module):
