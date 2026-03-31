@@ -59,7 +59,7 @@ class SparseBEVHead(DETRHead):
         self.label_enc = nn.Embedding(self.num_classes + 1, self.embed_dims - 1)  # DAB-DETR
         if self.use_class_query_init:
             self.query_class_content = nn.Embedding(self.num_classes, self.embed_dims - 1)
-            self.query_class_bbox = nn.Embedding(self.num_classes, 4)  # (z, log(w), log(l), log(h))
+            self.register_buffer('query_class_bbox', torch.zeros(self.num_classes, 4))  # (z, log(w), log(l), log(h))
             self.register_buffer('query_class_ids', torch.zeros(self.num_query, dtype=torch.long))
 
     def init_weights(self):
@@ -81,7 +81,7 @@ class SparseBEVHead(DETRHead):
 
                 class_bbox = self._encode_class_bbox_priors(self.class_bbox_priors)
                 self.query_class_ids.copy_(query_class_ids)
-                self.query_class_bbox.weight.copy_(class_bbox)
+                self.query_class_bbox.copy_(class_bbox)
                 self.query_class_content.weight.copy_(self.label_enc.weight[:self.num_classes])
             else:
                 self.init_query_bbox.weight[:, 2:3].zero_()
@@ -115,14 +115,19 @@ class SparseBEVHead(DETRHead):
         for ring_idx, count in enumerate(ring_counts):
             inner_radius = outer_radius * ring_idx / num_rings
             outer_ring_radius = outer_radius * (ring_idx + 1) / num_rings
-            radius = 0.5 * (inner_radius + outer_ring_radius)
+            radius_ratio = 0.5 * (inner_radius + outer_ring_radius) / outer_radius
 
             theta = torch.arange(count, dtype=torch.float32)
             theta = theta * (2 * math.pi / count)
             theta = theta + (math.pi / count if ring_idx % 2 else 0.0)
 
-            x = center_x + radius * torch.cos(theta)
-            y = center_y + radius * torch.sin(theta)
+            cos_theta = torch.cos(theta)
+            sin_theta = torch.sin(theta)
+            square_radius = outer_radius / torch.maximum(cos_theta.abs(), sin_theta.abs()).clamp(min=1e-6)
+            radius = radius_ratio * square_radius
+
+            x = center_x + radius * cos_theta
+            y = center_y + radius * sin_theta
             x = (x - x_min) / width
             y = (y - y_min) / height
             query_xy.append(torch.stack([x, y], dim=-1))
@@ -182,7 +187,7 @@ class SparseBEVHead(DETRHead):
         query_bbox = self.init_query_bbox.weight.clone()
 
         if self.use_class_query_init:
-            class_bbox = self.query_class_bbox(self.query_class_ids)
+            class_bbox = self.query_class_bbox[self.query_class_ids]
             # Each query keeps its own learnable residual on top of the class prototype.
             query_bbox[:, 2:3] = torch.clamp(class_bbox[:, 0:1] + query_bbox[:, 2:3], min=1e-3, max=1.0 - 1e-3)
             query_bbox[:, 3:6] = class_bbox[:, 1:4] + query_bbox[:, 3:6]

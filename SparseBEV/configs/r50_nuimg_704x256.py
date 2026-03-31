@@ -28,12 +28,6 @@ num_frames = 8
 num_levels = 4
 num_points = 4
 
-query_ring_init = dict(
-    num_rings=6,
-    base_queries=80,
-    growth=1.25,
-)
-
 # Ordered by `class_names`. z is the box center in LiDAR coordinates, while
 # w/l/h stay in metric space and will be encoded inside the head.
 query_class_bbox_priors = [
@@ -87,7 +81,6 @@ model = dict(
         query_denoising_groups=10,
         use_class_query_init=True,
         class_bbox_priors=query_class_bbox_priors,
-        ring_query_init=query_ring_init,
         code_size=10,
         code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         sync_cls_avg_factor=True,
