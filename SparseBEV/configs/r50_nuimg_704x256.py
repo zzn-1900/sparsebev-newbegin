@@ -28,6 +28,27 @@ num_frames = 8
 num_levels = 4
 num_points = 4
 
+query_ring_init = dict(
+    num_rings=6,
+    base_queries=80,
+    growth=1.25,
+)
+
+# Ordered by `class_names`. z is the box center in LiDAR coordinates, while
+# w/l/h stay in metric space and will be encoded inside the head.
+query_class_bbox_priors = [
+    dict(z=-0.93, w=1.96, l=4.63, h=1.74),   # car
+    dict(z=-0.38, w=2.52, l=6.94, h=2.84),   # truck
+    dict(z=-0.20, w=2.82, l=6.56, h=3.20),   # construction_vehicle
+    dict(z=-0.05, w=2.95, l=11.00, h=3.50),  # bus
+    dict(z=0.13, w=2.92, l=12.28, h=3.87),   # trailer
+    dict(z=-1.31, w=0.53, l=2.50, h=0.98),   # barrier
+    dict(z=-1.07, w=0.77, l=2.11, h=1.46),   # motorcycle
+    dict(z=-1.08, w=0.60, l=1.70, h=1.44),   # bicycle
+    dict(z=-0.92, w=0.68, l=0.73, h=1.76),   # pedestrian
+    dict(z=-1.26, w=0.41, l=0.41, h=1.08),   # traffic_cone
+]
+
 img_backbone = dict(
     type='ResNet',
     depth=50,
@@ -64,6 +85,9 @@ model = dict(
         num_query=num_query,
         query_denoising=True,
         query_denoising_groups=10,
+        use_class_query_init=True,
+        class_bbox_priors=query_class_bbox_priors,
+        ring_query_init=query_ring_init,
         code_size=10,
         code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         sync_cls_avg_factor=True,

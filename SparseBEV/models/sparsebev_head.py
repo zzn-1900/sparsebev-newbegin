@@ -19,6 +19,9 @@ class SparseBEVHead(DETRHead):
                  in_channels,
                  query_denoising=True,
                  query_denoising_groups=10,
+                 use_class_query_init=False,
+                 class_bbox_priors=None,
+                 ring_query_init=None,
                  bbox_coder=None,
                  code_size=10,
                  code_weights=[1.0] * 10,
@@ -33,12 +36,17 @@ class SparseBEVHead(DETRHead):
         self.test_cfg = test_cfg
         self.fp16_enabled = False
         self.embed_dims = in_channels
+        self.use_class_query_init = use_class_query_init
+        self.class_bbox_priors = class_bbox_priors
+        self.ring_query_init = ring_query_init
 
         super(SparseBEVHead, self).__init__(num_classes, in_channels, train_cfg=train_cfg, test_cfg=test_cfg, **kwargs)
 
         self.code_weights = nn.Parameter(torch.tensor(self.code_weights), requires_grad=False)
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
+
+        self._init_query_priors()
 
         self.dn_enabled = query_denoising
         self.dn_group_num = query_denoising_groups
@@ -49,25 +57,140 @@ class SparseBEVHead(DETRHead):
     def _init_layers(self):
         self.init_query_bbox = nn.Embedding(self.num_query, 10)  # (x, y, z, w, l, h, sin, cos, vx, vy)
         self.label_enc = nn.Embedding(self.num_classes + 1, self.embed_dims - 1)  # DAB-DETR
-
-        nn.init.zeros_(self.init_query_bbox.weight[:, 2:3])
-        nn.init.zeros_(self.init_query_bbox.weight[:, 8:10])
-        nn.init.constant_(self.init_query_bbox.weight[:, 5:6], 1.5)
-
-        grid_size = int(math.sqrt(self.num_query))
-        assert grid_size * grid_size == self.num_query
-        x = y = torch.arange(grid_size)
-        xx, yy = torch.meshgrid(x, y, indexing='ij')  # [0, grid_size - 1]
-        xy = torch.cat([xx[..., None], yy[..., None]], dim=-1)
-        xy = (xy + 0.5) / grid_size  # [0.5, grid_size - 0.5] / grid_size ~= (0, 1)
-        with torch.no_grad():
-            self.init_query_bbox.weight[:, :2] = xy.reshape(-1, 2)  # [Q, 2]
+        if self.use_class_query_init:
+            self.query_class_content = nn.Embedding(self.num_classes, self.embed_dims - 1)
+            self.query_class_bbox = nn.Embedding(self.num_classes, 4)  # (z, log(w), log(l), log(h))
+            self.register_buffer('query_class_ids', torch.zeros(self.num_query, dtype=torch.long))
 
     def init_weights(self):
         self.transformer.init_weights()
 
+    def _init_query_priors(self):
+        xy, query_class_ids = self._build_query_layout()
+
+        with torch.no_grad():
+            self.init_query_bbox.weight.zero_()
+            self.init_query_bbox.weight[:, :2] = xy
+            self.init_query_bbox.weight[:, 6:7].zero_()
+            self.init_query_bbox.weight[:, 7:8].fill_(1.0)
+            self.init_query_bbox.weight[:, 8:10].zero_()
+
+            if self.use_class_query_init:
+                if self.class_bbox_priors is None:
+                    raise ValueError('`class_bbox_priors` must be provided when `use_class_query_init=True`.')
+
+                class_bbox = self._encode_class_bbox_priors(self.class_bbox_priors)
+                self.query_class_ids.copy_(query_class_ids)
+                self.query_class_bbox.weight.copy_(class_bbox)
+                self.query_class_content.weight.copy_(self.label_enc.weight[:self.num_classes])
+            else:
+                self.init_query_bbox.weight[:, 2:3].zero_()
+                self.init_query_bbox.weight[:, 3:5].zero_()
+                self.init_query_bbox.weight[:, 5:6].fill_(math.log(1.5))
+
+    def _build_query_layout(self):
+        if self.ring_query_init is None:
+            return self._build_grid_query_layout()
+
+        num_rings = self.ring_query_init.get('num_rings', 6)
+        base_queries = self.ring_query_init.get('base_queries', 80)
+        growth = self.ring_query_init.get('growth', 1.25)
+
+        ring_counts = [int(base_queries * (growth ** idx)) for idx in range(num_rings)]
+        count_gap = self.num_query - sum(ring_counts)
+        ring_counts[-1] += count_gap
+        if ring_counts[-1] <= 0:
+            raise ValueError('Invalid ring query allocation. Please check `ring_query_init`.')
+
+        x_min, y_min, _, x_max, y_max, _ = self.pc_range
+        center_x = (x_min + x_max) * 0.5
+        center_y = (y_min + y_max) * 0.5
+        outer_radius = min(center_x - x_min, x_max - center_x, center_y - y_min, y_max - center_y)
+
+        query_xy = []
+        query_class_ids = []
+        width = x_max - x_min
+        height = y_max - y_min
+
+        for ring_idx, count in enumerate(ring_counts):
+            inner_radius = outer_radius * ring_idx / num_rings
+            outer_ring_radius = outer_radius * (ring_idx + 1) / num_rings
+            radius = 0.5 * (inner_radius + outer_ring_radius)
+
+            theta = torch.arange(count, dtype=torch.float32)
+            theta = theta * (2 * math.pi / count)
+            theta = theta + (math.pi / count if ring_idx % 2 else 0.0)
+
+            x = center_x + radius * torch.cos(theta)
+            y = center_y + radius * torch.sin(theta)
+            x = (x - x_min) / width
+            y = (y - y_min) / height
+            query_xy.append(torch.stack([x, y], dim=-1))
+
+            if self.use_class_query_init:
+                query_class_ids.append(torch.arange(count, dtype=torch.long) % self.num_classes)
+
+        xy = torch.cat(query_xy, dim=0)
+        if xy.shape[0] != self.num_query:
+            raise ValueError('Ring query initialization produced {} queries, expected {}.'.format(xy.shape[0], self.num_query))
+
+        if self.use_class_query_init:
+            return xy, torch.cat(query_class_ids, dim=0)
+
+        return xy, None
+
+    def _build_grid_query_layout(self):
+        grid_size = int(math.sqrt(self.num_query))
+        if grid_size * grid_size != self.num_query:
+            raise ValueError('Grid query initialization requires a square number of queries.')
+
+        x = y = torch.arange(grid_size, dtype=torch.float32)
+        xx, yy = torch.meshgrid(x, y, indexing='ij')  # [0, grid_size - 1]
+        xy = torch.cat([xx[..., None], yy[..., None]], dim=-1)
+        xy = (xy + 0.5) / grid_size
+
+        query_class_ids = None
+        if self.use_class_query_init:
+            query_class_ids = torch.arange(self.num_query, dtype=torch.long) % self.num_classes
+
+        return xy.reshape(-1, 2), query_class_ids
+
+    def _encode_class_bbox_priors(self, class_bbox_priors):
+        encoded_priors = []
+        z_min, z_max = self.pc_range[2], self.pc_range[5]
+        z_span = z_max - z_min
+
+        for prior in class_bbox_priors:
+            if isinstance(prior, dict):
+                z = prior['z']
+                w = prior['w']
+                l = prior['l']
+                h = prior['h']
+            else:
+                z, w, l, h = prior
+
+            z = (z - z_min) / z_span
+            z = min(max(z, 1e-3), 1.0 - 1e-3)
+            encoded_priors.append([z, math.log(w), math.log(l), math.log(h)])
+
+        if len(encoded_priors) != self.num_classes:
+            raise ValueError('Expected {} class bbox priors, but got {}.'.format(self.num_classes, len(encoded_priors)))
+
+        return self.init_query_bbox.weight.new_tensor(encoded_priors)
+
+    def _build_init_query_bbox(self):
+        query_bbox = self.init_query_bbox.weight.clone()
+
+        if self.use_class_query_init:
+            class_bbox = self.query_class_bbox(self.query_class_ids)
+            # Each query keeps its own learnable residual on top of the class prototype.
+            query_bbox[:, 2:3] = torch.clamp(class_bbox[:, 0:1] + query_bbox[:, 2:3], min=1e-3, max=1.0 - 1e-3)
+            query_bbox[:, 3:6] = class_bbox[:, 1:4] + query_bbox[:, 3:6]
+
+        return query_bbox
+
     def forward(self, mlvl_feats, img_metas):
-        query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
+        query_bbox = self._build_init_query_bbox()  # [Q, 10]
         #query_bbox[..., :3] = query_bbox[..., :3].sigmoid()
 
         # query denoising
@@ -123,7 +246,10 @@ class SparseBEVHead(DETRHead):
 
         device = init_query_bbox.device
         indicator0 = torch.zeros([self.num_query, 1], device=device)
-        init_query_feat = label_enc.weight[self.num_classes].repeat(self.num_query, 1)
+        if self.use_class_query_init:
+            init_query_feat = self.query_class_content(self.query_class_ids)
+        else:
+            init_query_feat = label_enc.weight[self.num_classes].repeat(self.num_query, 1)
         init_query_feat = torch.cat([init_query_feat, indicator0], dim=1)
 
         if self.training and self.dn_enabled:
