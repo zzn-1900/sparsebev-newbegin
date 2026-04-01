@@ -164,7 +164,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=dataset_root,
-        ann_file=dataset_root + 'nuscenes_infos_train_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_train_mini_sweep.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -174,7 +174,7 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=dataset_root,
-        ann_file=dataset_root + 'nuscenes_infos_val_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_val_mini_sweep.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -183,7 +183,7 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=dataset_root,
-        ann_file=dataset_root + 'nuscenes_infos_test_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_test_mini_sweep.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -215,7 +215,7 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3
 )
-total_epochs = 24
+total_epochs = 5
 batch_size = 8
 
 # load pretrained weights

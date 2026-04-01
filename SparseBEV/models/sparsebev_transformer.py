@@ -142,6 +142,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
             qgtg_cfg.pop('enabled', None)
             self.temporal_gate = QueryGuidedTemporalGate(
                 query_dim=self.embed_dims,
+                num_groups=self.num_groups,
                 group_dim=self.embed_dims // self.num_groups,
                 **qgtg_cfg
             )
@@ -203,8 +204,10 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
             return_temporal=self.use_qgtg
         )
         if self.temporal_gate is not None:
+            sampled_feat, local_offset = sampled_feat
             sampled_feat = self.temporal_gate(
-                query_feat, query_bbox, sampled_feat, img_metas[0]['time_diff']
+                query_feat, query_bbox, sampled_feat, img_metas[0]['time_diff'],
+                local_offset
             )
             sampled_feat = sampled_feat.flatten(3, 4)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
@@ -318,6 +321,7 @@ class SparseBEVSampling(BaseModule):
         # sampling offset of all frames
         sampling_offset = self.sampling_offset(query_feat)
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
+        local_offset = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
         sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
@@ -349,6 +353,9 @@ class SparseBEVSampling(BaseModule):
             return_temporal=return_temporal
         )  # [B, Q, G, FP, C] or [B, Q, G, T, P, C]
 
+        if return_temporal:
+            return sampled_feats, local_offset
+
         return sampled_feats
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas,
@@ -365,20 +372,28 @@ class SparseBEVSampling(BaseModule):
 
 
 class QueryGuidedTemporalGate(nn.Module):
-    def __init__(self, query_dim, group_dim, hidden_dim=64, lambda_gate=0.5,
+    def __init__(self, query_dim, num_groups, group_dim, hidden_dim=64,
+                 score_dropout=0.0, lambda_gate=0.5,
                  use_motion_prior=True, current_frame_bias=0.1,
                  dump_alpha=False):
         super(QueryGuidedTemporalGate, self).__init__()
 
+        self.num_groups = num_groups
+        self.score_dropout = score_dropout
         self.lambda_gate = lambda_gate
         self.use_motion_prior = use_motion_prior
         self.current_frame_bias = current_frame_bias
         self.dump_alpha = dump_alpha
 
-        self.query_proj = nn.Linear(query_dim, hidden_dim)
+        self.query_proj = nn.Linear(query_dim, num_groups * hidden_dim)
         self.hist_proj = nn.Linear(group_dim, hidden_dim)
         self.cur_proj = nn.Linear(group_dim, hidden_dim)
         self.diff_proj = nn.Linear(group_dim, hidden_dim)
+        self.offset_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
         self.time_mlp = nn.Sequential(
             nn.Linear(3, hidden_dim),
@@ -396,8 +411,9 @@ class QueryGuidedTemporalGate(nn.Module):
             self.motion_mlp = None
 
         self.score_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 5, hidden_dim),
+            nn.Linear(hidden_dim * 6, hidden_dim),
             nn.SiLU(inplace=True),
+            nn.Dropout(score_dropout),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -406,23 +422,29 @@ class QueryGuidedTemporalGate(nn.Module):
         nn.init.zeros_(self.score_mlp[-1].weight)
         nn.init.zeros_(self.score_mlp[-1].bias)
 
-    def inner_forward(self, query_feat, query_bbox, sampled_feats_ts, time_diff):
+    def inner_forward(self, query_feat, query_bbox, sampled_feats_ts, time_diff,
+                      local_offset):
         """
         query_feat: [B, Q, Cq]
         query_bbox: [B, Q, 10]
         sampled_feats_ts: [B, Q, G, T, P, Cg]
         time_diff: [B, T]
+        local_offset: [B, Q, G, P, 3]
         """
         B, Q, G, T, P, _ = sampled_feats_ts.shape
+        assert G == self.num_groups
 
         x_hist = sampled_feats_ts
         x_cur = x_hist[:, :, :, :1, :, :].expand(B, Q, G, T, P, -1)
 
-        q_feat = self.query_proj(query_feat[:, :, None, None, None, :])
-        q_feat = q_feat.expand(B, Q, G, T, P, -1)
+        q_feat = self.query_proj(query_feat)
+        q_feat = q_feat.reshape(B, Q, self.num_groups, -1)
+        q_feat = q_feat[:, :, :, None, None, :].expand(B, Q, G, T, P, -1)
         hist_feat = self.hist_proj(x_hist)
         cur_feat = self.cur_proj(x_cur)
         diff_feat = self.diff_proj(torch.abs(x_hist - x_cur))
+        offset_feat = self.offset_mlp(local_offset[:, :, :, None, :, :])
+        offset_feat = offset_feat.expand(B, Q, G, T, P, -1)
 
         dt = time_diff[:, None, None, :, None].expand(B, Q, G, T, P)
         dt_feat = torch.stack([dt, dt.abs(), dt * dt], dim=-1)
@@ -441,7 +463,8 @@ class QueryGuidedTemporalGate(nn.Module):
             temporal_feat = temporal_feat + self.motion_mlp(motion_input)
 
         score_input = torch.cat(
-            [q_feat, hist_feat, cur_feat, diff_feat, temporal_feat], dim=-1
+            [q_feat, hist_feat, cur_feat, diff_feat, offset_feat, temporal_feat],
+            dim=-1
         )
         scores = self.score_mlp(score_input)
 
@@ -460,14 +483,17 @@ class QueryGuidedTemporalGate(nn.Module):
 
         return gated
 
-    def forward(self, query_feat, query_bbox, sampled_feats_ts, time_diff):
+    def forward(self, query_feat, query_bbox, sampled_feats_ts, time_diff,
+                local_offset):
         if self.training and sampled_feats_ts.requires_grad:
             return cp(
                 self.inner_forward, query_feat, query_bbox, sampled_feats_ts,
-                time_diff, use_reentrant=False
+                time_diff, local_offset, use_reentrant=False
             )
         else:
-            return self.inner_forward(query_feat, query_bbox, sampled_feats_ts, time_diff)
+            return self.inner_forward(
+                query_feat, query_bbox, sampled_feats_ts, time_diff, local_offset
+            )
 
 
 class AdaptiveMixing(nn.Module):
