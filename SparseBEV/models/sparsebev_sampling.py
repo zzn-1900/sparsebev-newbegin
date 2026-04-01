@@ -24,7 +24,8 @@ def make_sample_points(query_bbox, offset, pc_range):
     return sample_xyz  # [B, Q, P, 3]
 
 
-def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, image_w, eps=1e-5):
+def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, image_w,
+                eps=1e-5, return_temporal=False):
     """
     Args:
         sample_points: 3D sampling points in shape [B, Q, T, G, P, 3]
@@ -124,7 +125,9 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, im
     # reorganize the sampled features
     C = final.shape[2]  # [BTG, Q, C, P]
     final = final.reshape(B, T, G, Q, C, P)
-    final = final.permute(0, 3, 2, 1, 5, 4)
-    final = final.flatten(3, 4)  # [B, Q, G, FP, C]
+    final = final.permute(0, 3, 2, 1, 5, 4)  # [B, Q, G, T, P, C]
+
+    if not return_temporal:
+        final = final.flatten(3, 4)  # [B, Q, G, FP, C]
 
     return final

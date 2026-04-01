@@ -15,7 +15,9 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6,
+                 num_levels=4, num_classes=10, code_size=10, pc_range=[],
+                 qgtg=None, init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +25,10 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(
+            embed_dims, num_frames, num_points, num_layers, num_levels,
+            num_classes, code_size, pc_range=pc_range, qgtg=qgtg
+        )
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +44,17 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6,
+                 num_levels=4, num_classes=10, code_size=10, pc_range=[],
+                 qgtg=None, init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes,
+            code_size, pc_range=pc_range, qgtg=qgtg
         )
 
     @torch.no_grad()
@@ -102,13 +110,17 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4,
+                 num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2,
+                 pc_range=[], qgtg=None, init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
         self.num_classes = num_classes
         self.code_size = code_size
         self.pc_range = pc_range
+        self.num_groups = 4
+        assert self.embed_dims % self.num_groups == 0
 
         self.position_encoder = nn.Sequential(
             nn.Linear(3, self.embed_dims), 
@@ -120,8 +132,25 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         )
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
-        self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.sampling = SparseBEVSampling(
+            embed_dims, num_frames=num_frames, num_groups=self.num_groups,
+            num_points=num_points, num_levels=num_levels, pc_range=pc_range
+        )
+        self.use_qgtg = qgtg is not None and qgtg.get('enabled', False)
+        if self.use_qgtg:
+            qgtg_cfg = dict(qgtg)
+            qgtg_cfg.pop('enabled', None)
+            self.temporal_gate = QueryGuidedTemporalGate(
+                query_dim=self.embed_dims,
+                group_dim=self.embed_dims // self.num_groups,
+                **qgtg_cfg
+            )
+        else:
+            self.temporal_gate = None
+        self.mixing = AdaptiveMixing(
+            in_dim=embed_dims, in_points=num_points * num_frames,
+            n_groups=self.num_groups, out_points=128
+        )
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -147,6 +176,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
     def init_weights(self):
         self.self_attn.init_weights()
         self.sampling.init_weights()
+        if self.temporal_gate is not None:
+            self.temporal_gate.init_weights()
         self.mixing.init_weights()
 
         bias_init = bias_init_with_prob(0.01)
@@ -167,7 +198,15 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat = self.sampling(
+            query_bbox, query_feat, mlvl_feats, img_metas,
+            return_temporal=self.use_qgtg
+        )
+        if self.temporal_gate is not None:
+            sampled_feat = self.temporal_gate(
+                query_feat, query_bbox, sampled_feat, img_metas[0]['time_diff']
+            )
+            sampled_feat = sampled_feat.flatten(3, 4)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -267,7 +306,8 @@ class SparseBEVSampling(BaseModule):
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
 
-    def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
+    def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas,
+                      return_temporal=False):
         '''
         query_bbox: [B, Q, 10]
         query_feat: [B, Q, C]
@@ -305,16 +345,129 @@ class SparseBEVSampling(BaseModule):
             mlvl_feats,
             scale_weights,
             img_metas[0]['lidar2img'],
-            image_h, image_w
-        )  # [B, Q, G, FP, C]
+            image_h, image_w,
+            return_temporal=return_temporal
+        )  # [B, Q, G, FP, C] or [B, Q, G, T, P, C]
 
         return sampled_feats
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
+    def forward(self, query_bbox, query_feat, mlvl_feats, img_metas,
+                return_temporal=False):
         if self.training and query_feat.requires_grad:
-            return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
+            return cp(
+                self.inner_forward, query_bbox, query_feat, mlvl_feats,
+                img_metas, return_temporal, use_reentrant=False
+            )
         else:
-            return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
+            return self.inner_forward(
+                query_bbox, query_feat, mlvl_feats, img_metas, return_temporal
+            )
+
+
+class QueryGuidedTemporalGate(nn.Module):
+    def __init__(self, query_dim, group_dim, hidden_dim=64, lambda_gate=0.5,
+                 use_motion_prior=True, current_frame_bias=0.1,
+                 dump_alpha=False):
+        super(QueryGuidedTemporalGate, self).__init__()
+
+        self.lambda_gate = lambda_gate
+        self.use_motion_prior = use_motion_prior
+        self.current_frame_bias = current_frame_bias
+        self.dump_alpha = dump_alpha
+
+        self.query_proj = nn.Linear(query_dim, hidden_dim)
+        self.hist_proj = nn.Linear(group_dim, hidden_dim)
+        self.cur_proj = nn.Linear(group_dim, hidden_dim)
+        self.diff_proj = nn.Linear(group_dim, hidden_dim)
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        if self.use_motion_prior:
+            self.motion_mlp = nn.Sequential(
+                nn.Linear(4, hidden_dim),
+                nn.SiLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.motion_mlp = None
+
+        self.score_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 5, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @torch.no_grad()
+    def init_weights(self):
+        nn.init.zeros_(self.score_mlp[-1].weight)
+        nn.init.zeros_(self.score_mlp[-1].bias)
+
+    def inner_forward(self, query_feat, query_bbox, sampled_feats_ts, time_diff):
+        """
+        query_feat: [B, Q, Cq]
+        query_bbox: [B, Q, 10]
+        sampled_feats_ts: [B, Q, G, T, P, Cg]
+        time_diff: [B, T]
+        """
+        B, Q, G, T, P, _ = sampled_feats_ts.shape
+
+        x_hist = sampled_feats_ts
+        x_cur = x_hist[:, :, :, :1, :, :].expand(B, Q, G, T, P, -1)
+
+        q_feat = self.query_proj(query_feat[:, :, None, None, None, :])
+        q_feat = q_feat.expand(B, Q, G, T, P, -1)
+        hist_feat = self.hist_proj(x_hist)
+        cur_feat = self.cur_proj(x_cur)
+        diff_feat = self.diff_proj(torch.abs(x_hist - x_cur))
+
+        dt = time_diff[:, None, None, :, None].expand(B, Q, G, T, P)
+        dt_feat = torch.stack([dt, dt.abs(), dt * dt], dim=-1)
+        temporal_feat = self.time_mlp(dt_feat)
+
+        current_mask = torch.arange(T, device=x_hist.device)
+        current_mask = (current_mask.view(1, 1, 1, T, 1, 1) == 0).to(x_hist.dtype)
+        current_mask = current_mask.expand(B, Q, G, T, P, 1)
+
+        if self.use_motion_prior:
+            vel = query_bbox[..., 8:10][:, :, None, None, None, :]
+            vel = vel.expand(B, Q, G, T, P, -1)
+            speed = torch.norm(query_bbox[..., 8:10], dim=-1, keepdim=True)
+            speed = speed[:, :, None, None, None, :].expand(B, Q, G, T, P, -1)
+            motion_input = torch.cat([vel, speed, current_mask], dim=-1)
+            temporal_feat = temporal_feat + self.motion_mlp(motion_input)
+
+        score_input = torch.cat(
+            [q_feat, hist_feat, cur_feat, diff_feat, temporal_feat], dim=-1
+        )
+        scores = self.score_mlp(score_input)
+
+        if self.current_frame_bias != 0.0:
+            scores = scores + current_mask * self.current_frame_bias
+
+        alpha = torch.softmax(scores, dim=3)
+        gated = x_hist * (1.0 + self.lambda_gate * alpha)
+
+        if self.dump_alpha and DUMP.enabled:
+            alpha_mean = alpha.squeeze(-1).mean(dim=(2, 4))
+            torch.save(
+                alpha_mean.cpu(),
+                '{}/qgtg_alpha_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count)
+            )
+
+        return gated
+
+    def forward(self, query_feat, query_bbox, sampled_feats_ts, time_diff):
+        if self.training and sampled_feats_ts.requires_grad:
+            return cp(
+                self.inner_forward, query_feat, query_bbox, sampled_feats_ts,
+                time_diff, use_reentrant=False
+            )
+        else:
+            return self.inner_forward(query_feat, query_bbox, sampled_feats_ts, time_diff)
 
 
 class AdaptiveMixing(nn.Module):
