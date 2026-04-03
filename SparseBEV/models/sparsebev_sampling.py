@@ -116,7 +116,8 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, im
     # reorganize the tensor to stack T and G to the batch dim for better parallelism
     scale_weights = scale_weights.reshape(B, Q, G, T, P, -1)
     scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5)
-    scale_weights = scale_weights.reshape(B*G*T, Q, P, -1)
+    # The custom CUDA op requires contiguous attention weights.
+    scale_weights = scale_weights.reshape(B*G*T, Q, P, -1).contiguous()
 
     # multi-scale multi-view grid sample
     final = msmv_sampling(mlvl_feats, sample_points_cam, scale_weights)
