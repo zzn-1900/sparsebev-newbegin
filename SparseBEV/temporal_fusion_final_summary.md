@@ -1,538 +1,713 @@
-# SparseBEV 时序融合改进方案 —— 完整技术细节总结
+# SparseBEV 当前时序融合结构总览
 
-> 本文档精确记录所有改动的每一个细节，包括张量维度、算子、初始化策略和数值范围。
->
-> **符号约定**（以 `r50_nuimg_704x256` 配置为例）：
->
-> | 符号 | 含义 | 默认值 |
-> |------|------|--------|
-> | B | batch size | 8 |
-> | Q | query 数量 | 900 |
-> | F/T | 时间帧数 | 8 |
-> | G | 采样分组数 | 4 |
-> | P | 每组每帧采样点数 | 4 |
-> | N | 相机视角数 | 6 |
-> | L | FPN 层数 | 4 |
-> | C | 特征通道数 (embed_dims) | 256 |
-> | C_g | 分组通道数 (C / G) | 64 |
+本文档以当前代码实现为准，聚焦 3 个已经落地的改动：
 
----
+1. `scale` 分支：用 `query_feat + [|dt|, range_t, size]` 直接生成多尺度采样权重
+2. `temporal` 分支：用 `query_feat + [|dt|, speed]` 生成逐帧可信度权重
+3. `mixing` 分支：用 `[|dt|, point_offset]` 给采样点注入时序几何编码
 
-## 一、改动文件清单
+对应代码文件：
 
-| 文件 | 改动类型 |
-|------|---------|
-| `models/sparsebev_transformer.py` | 修改 4 个类 |
-| `models/sparsebev_sampling.py` | 修改 `sampling_4d` 函数返回值 |
+- `SparseBEV/models/sparsebev_transformer.py`
 
----
+## 1. 审查结论
 
-## 二、改动总览
+基于当前实现做了一次代码级审查，结论是：
 
-```
-原始流程:
-  sampling_offset(query_feat) → make_sample_points → 速度补偿(v×Δt) → sampling_4d
-  → AdaptiveMixing(channel_mix + point_mix + 残差) → FFN → cls/reg
+- 这 3 个改动之间的语义是自洽的，没有发现明显的 shape 错误、softmax 维度错误或张量顺序错误。
+- 三个分支都已经从“按 frame slot 编号建模”切到“按真实时间距离 `|dt|` 建模”，这一点和数据加载的随机时间间隔设定是匹配的。
+- `scale`、`temporal`、`mixing` 的条件变量划分也基本合理：谁负责尺度、谁负责帧可信度、谁负责点间几何关系，边界比较清楚。
 
-改进后流程:
-  sampling_offset(query_feat) → make_sample_points → 速度补偿(v×Δt + 非线性修正)
-  → sampling_4d(返回特征 + 有效率)
-  → 查询自适应时序权重 + 有效性softmax加权 → 特征加权
-  → AdaptiveMixing(连续时序编码 + channel_mix + point_mix，无残差)
-  → 运动自适应门控残差 → FFN → cls/reg
-```
+目前没有看到必须马上修改的硬错误，但有 3 个设计边界需要明确：
 
----
+- 当前所有学习分支都只看 `|dt|`，不区分过去和未来。如果以后你希望模型显式地区分“历史帧”和“未来帧”，需要把有符号 `dt` 再引回来。
+- `scale` 分支里的 `range_t` 目前是 BEV 平面距离 `sqrt(x^2 + y^2)`，不是 3D 欧式距离。这对尺度选择通常是合理的，因为 FPN 尺度更主要受横向距离影响。
+- `temporal` 分支里的 `speed` 现在直接使用原始米每秒，没有做 `log1p` 或 clipping。当前不算 bug，但如果后面训练波动明显，可以优先检查这个输入量级。
 
-## 三、逐模块详细改动
+已完成的本地检查：
 
-### 3.1 SparseBEVSampling —— 采样阶段
+- `python3 -m py_compile SparseBEV/models/sparsebev_transformer.py`
 
-#### 3.1.1 新增参数
+说明：
 
-```python
-# ① 时序感知尺度偏置 [F, L] = [8, 4]
-self.temporal_scale_bias = nn.Parameter(torch.zeros(8, 4))
-# 参数量: 32, 初始化: zeros
+- 当前 shell 里的 `python3` 没有 `torch`，所以这次没有做随机张量前向单测；下面的结论来自代码级 shape 审查和初始化分析。
 
-# ② 查询自适应时序权重 Linear(C, G*F) = Linear(256, 32)
-self.temporal_refine = nn.Linear(256, 32)
-# 参数量: 256×32 + 32 = 8,224, 初始化: zeros(weight), zeros(bias)
+## 2. 符号约定
 
-# ③ 自适应速度补偿修正 Linear(C, F*2) = Linear(256, 16)
-self.velocity_correction = nn.Linear(256, 16)
-# 参数量: 256×16 + 16 = 4,112, 初始化: zeros(weight), zeros(bias)
+| 符号 | 含义 |
+|---|---|
+| `B` | batch size |
+| `Q` | query 数量 |
+| `F` | 时间帧数 `num_frames` |
+| `G` | sampling group 数 |
+| `Ppf` | 每帧每 group 的采样点数 `num_points` |
+| `FP` | 总采样点数，`FP = F * Ppf` |
+| `L` | FPN level 数 |
+| `C` | query/embed 通道数 |
+| `H` | 条件分支隐藏维度，当前为 `16` |
+| `C_g` | group 内通道数，`C_g = C / G` |
+
+在默认配置里通常是：
+
+```text
+C   = 256
+F   = 8
+G   = 4
+Ppf = 4
+FP  = 32
+L   = 4
+H   = 16
+C_g = 64
 ```
 
-#### 3.1.2 自适应速度补偿残差修正
+## 3. 总体流程
 
-**位置**：`inner_forward`，在原始线性速度补偿之后
-
-**原始代码**：
-```python
-dist = vel * time_diff                    # [B, Q, F, 2]
-dist = dist[:, :, :, None, None, :]       # [B, Q, F, 1, 1, 2]
+```text
+query_bbox [B,Q,10]          query_feat [B,Q,C]
+        |                           |
+        | position_encoder          |
+        +------------ add ----------+
+                    |
+             self_attn + norm
+                    |
+                    v
+        +-------------------------------+
+        |      SparseBEVSampling        |
+        |                               |
+        |  1) sampling_offset           |
+        |  2) make_sample_points        |
+        |  3) dist = vel * dt           |
+        |  4) temporal_ctx              |
+        |  5) scale_ctx                 |
+        |  6) scale_weights             |
+        |  7) sampling_4d               |
+        |  8) temporal_weights          |
+        +-------------------------------+
+                    |
+     sampled_feat [B,Q,G,FP,C_g]
+     point_offset [B,Q,G,FP,3]
+                    |
+                    v
+        +-------------------------------+
+        |         AdaptiveMixing        |
+        |                               |
+        |  pos_desc = [|dt|, dx,dy,dz]  |
+        |  temp_pos -> add to x         |
+        |  channel mixing               |
+        |  point mixing                 |
+        |  out_proj + residual          |
+        +-------------------------------+
+                    |
+              norm + ffn
+                    |
+               cls / reg
 ```
 
-**改进后**：
-```python
-# ---- 原始线性补偿 ----
-time_diff = img_metas[0]['time_diff']          # [B, F]          值域: 秒, 当前帧=0
-time_diff = time_diff[:, None, :, None]        # [B, 1, F, 1]
-vel = query_bbox[..., 8:].detach()             # [B, Q, 2]      单位: m/s
-vel = vel[:, :, None, :]                       # [B, Q, 1, 2]
-dist = vel * time_diff                         # [B, Q, F, 2]   单位: m (世界坐标)
+## 4. 三个改动的结构细节
 
-# ---- 新增: 非线性修正 ----
-vel_correction = self.velocity_correction(query_feat)  # Linear(256→16)
-                                                        # 输入: [B, Q, 256]
-                                                        # 输出: [B, Q, 16]
-vel_correction = vel_correction.view(B, Q, F, 2)       # [B, Q, 8, 2]
-vel_correction = torch.tanh(vel_correction) * 2.0       # [B, Q, 8, 2]  值域: [-2.0, +2.0] 米
+### 4.1 Scale 分支
 
-# 屏蔽当前帧 (time_diff=0的帧不需要修正)
-td_mask = img_metas[0]['time_diff'].abs()               # [B, F]
-td_mask = (td_mask > 1e-5).float()[:, None, :, None]   # [B, 1, F, 1]  二值: 0或1
-vel_correction = vel_correction * td_mask                # [B, Q, F, 2]  当前帧修正=0
+目标：
 
-dist = dist + vel_correction                             # [B, Q, F, 2]
+- 在每个 frame 上，根据真实时间距离、该时刻物体离原点的距离、物体尺寸，决定该 frame 的采样点更适合从哪个 FPN level 取特征。
 
-dist = dist[:, :, :, None, None, :]                     # [B, Q, F, 1, 1, 2]
-sampling_points[..., 0:2] -= dist                        # [B, Q, F, G, P, 2] -= [B, Q, F, 1, 1, 2]
+核心设计：
+
+- 不再做“原始 `scale_weights(query_feat)` + 时序偏置”的加法修正。
+- 改成直接用条件化后的 `scale_ctx` 生成完整的 `[G, Ppf, L]` logits。
+
+#### 4.1.1 输入量
+
+```text
+query_feat : [B, Q, C]
+time_diff  : [B, F]
+range_t    : [B, Q, F, 1]
+size_log   : [B, Q, 3]
 ```
 
-**张量流**：
-```
-query_feat [B,Q,256] → Linear(256,16) → [B,Q,16] → view → [B,Q,8,2]
-  → tanh → ×2.0 → [B,Q,8,2] (值域 ±2m)
-  → × td_mask [B,1,8,1] → [B,Q,8,2] (当前帧=0)
-  → + dist [B,Q,8,2] → 最终位移
-```
+其中：
 
-#### 3.1.3 时序感知的多尺度权重
+- `time_diff` 是当前帧与各个时序帧的真实时间差，单位秒
+- `range_t` 是传播到该 frame 后，query center 在 BEV 平面到原点的距离
+- `size_log` 是 box 的对数尺寸，直接来自 `query_bbox[..., 3:6]`
 
-**位置**：`inner_forward`，scale_weights 计算处
+#### 4.1.2 张量流
 
-**原始代码**：
-```python
-scale_weights = self.scale_weights(query_feat).view(B, Q, G, 1, P, L)  # [B,Q,4,1,4,4]
-scale_weights = torch.softmax(scale_weights, dim=-1)                     # 在L维softmax
-scale_weights = scale_weights.expand(B, Q, G, F, P, L)                  # [B,Q,4,8,4,4]
-```
+```text
+query_feat [B,Q,C]
+  -> scale_query_proj
+  -> [B,Q,H]
+  -> unsqueeze(2)
+  -> query_ctx [B,Q,1,H]
 
-**改进后**：
-```python
-scale_weights = self.scale_weights(query_feat).view(B, Q, G, 1, P, L)   # [B,Q,4,1,4,4]
+time_diff [B,F]
+  -> abs
+  -> [B,1,F,1]
+  -> expand
+  -> td_abs [B,Q,F,1]
 
-tsb = self.temporal_scale_bias.view(1, 1, 1, F, 1, L)                    # [1,1,1,8,1,4]
-# temporal_scale_bias: [8, 4], 每帧对每个FPN层的偏好偏置
+range_t [B,Q,F,1]
+  -> log1p
+  -> range_feat [B,Q,F,1]
 
-scale_weights = scale_weights.expand(B, Q, G, F, P, L)                   # [B,Q,4,8,4,4]
-scale_weights = torch.softmax(scale_weights + tsb, dim=-1)                # [B,Q,4,8,4,4]
-# 先expand再加偏置再softmax，不同帧有不同的尺度偏好
-```
+size_log [B,Q,3]
+  -> unsqueeze(2) + expand
+  -> size_feat [B,Q,F,3]
 
-**张量流**：
-```
-scale_weights [B,Q,4,1,4,4] → expand → [B,Q,4,8,4,4]
-  + temporal_scale_bias [1,1,1,8,1,4] (broadcast)
-  → softmax(dim=-1) → [B,Q,4,8,4,4]
-```
+cat([td_abs, range_feat, size_feat], dim=-1)
+  -> scale_desc [B,Q,F,5]
+  -> scale_motion_encoder
+  -> [B,Q,F,H]
 
-#### 3.1.4 查询自适应时序权重 + 有效性加权
+query_ctx [B,Q,1,H]
+  + motion_ctx [B,Q,F,H]
+  -> broadcast add
+  -> [B,Q,F,H]
+  -> ReLU
+  -> scale_ctx [B,Q,F,H]
 
-**位置**：`inner_forward`，sampling_4d 返回之后
-
-**完整计算流程**：
-```python
-# ---- 步骤1: 查询自适应时序权重 (logits) ----
-query_temporal_w = self.temporal_refine(query_feat)             # Linear(256→32)
-                                                                 # 输入: [B, Q, 256]
-                                                                 # 输出: [B, Q, 32]
-query_temporal_w = query_temporal_w.view(B, Q, G, F)            # [B, Q, 4, 8]
-# 每个 query 对每个 group 的每帧产生一个标量 logit
-# 初始: 零初始化 → 全零 → softmax 后均匀分布
-
-# ---- 步骤2: 采样点有效性置信度 ----
-fv = frame_validity.detach().clone()                             # [B, Q, G, F] = [B, Q, 4, 8]
-fv[:, :, :, 0] = fv[:, :, :, 0].clamp(min=0.1)                # 当前帧最小权重保护
-
-# 将有效率转化为 log-space mask（无效帧→大负值→softmax后权重≈0）
-validity_mask = torch.log(fv + 1e-6)                            # [B, Q, 4, 8]
-# fv=1.0 → log(1.0)=0.0 (不影响)
-# fv=0.0 → log(1e-6)=-13.8 (softmax后≈0)
-# fv=0.5 → log(0.5)=-0.69 (适度降权)
-
-# ---- 步骤3: softmax 归一化 ----
-temporal_weights = torch.softmax(
-    query_temporal_w + validity_mask,                            # [B, Q, 4, 8]
-    dim=-1                                                       # 在 F 维 softmax
-) * F                                                            # [B, Q, 4, 8]
-# softmax 输出 sum=1，乘 F=8 后 sum=F=8
-# 初始(全零logits + 全valid): softmax([0,...,0]) = [1/8,...,1/8] × 8 = [1,...,1]
-# 与原始等权融合完全一致
-
-# ---- 步骤4: 展开到逐点级别 ----
-temporal_weights = temporal_weights.unsqueeze(-1)                # [B, Q, 4, 8, 1]
-temporal_weights = temporal_weights.expand(B, Q, G, F, P)        # [B, Q, 4, 8, 4]
-temporal_weights = temporal_weights.reshape(B, Q, G, F*P, 1)     # [B, Q, 4, 32, 1]
-
-# ---- 步骤5: 应用到采样特征 ----
-sampled_feats = sampled_feats * temporal_weights                  # [B,Q,4,32,64] × [B,Q,4,32,1]
-                                                                   # broadcast → [B, Q, 4, 32, 64]
+scale_ctx [B,Q,F,H]
+  -> scale_weights_head
+  -> [B,Q,F,G*Ppf*L]
+  -> view
+  -> [B,Q,F,G,Ppf,L]
+  -> permute
+  -> [B,Q,G,F,Ppf,L]
+  -> softmax(dim=L)
+  -> scale_weights [B,Q,G,F,Ppf,L]
 ```
 
-**张量流总结**：
-```
-query_feat [B,Q,C] → Linear(256,32) → [B,Q,32]
-  → view → [B,Q,G,F] (logits)
-                           │
-frame_validity [B,Q,G,F]  │
-  → clone → clamp(t=0,min=0.1)
-  → log(·+1e-6) → validity_mask [B,Q,G,F]
-                           │
-                logits + validity_mask
-                           │
-                    softmax(dim=F) × F
-                           │
-                    expand → [B,Q,G,F*P,1]
-                           │
-sampled_feats [B,Q,G,F*P,C] ──→ × ──→ weighted_feats [B,Q,G,F*P,C]
-```
+#### 4.1.3 ASCII 结构图
 
----
+```text
+                        +------------------------+
+query_feat [B,Q,C] ---->| scale_query_proj       |----+
+                        +------------------------+    |
+                                                      v
+                                                query_ctx
+                                                [B,Q,1,H]
 
-### 3.2 sampling_4d —— 有效性信息返回
+time_diff [B,F] -- abs -- expand ----------------------+
+range_t   [B,Q,F,1] -- log1p --------------------------+--> cat --> scale_desc [B,Q,F,5]
+size_log  [B,Q,3] -- expand ---------------------------+
 
-#### 3.2.1 改动位置
+scale_desc [B,Q,F,5]
+  -> Linear(5,H)
+  -> ReLU
+  -> Linear(H,H)
+  -> motion_ctx [B,Q,F,H]
 
-`models/sparsebev_sampling.py`，函数末尾
-
-#### 3.2.2 新增代码
-
-```python
-# ---- 原始: 仅返回 final ----
-# return final  # [B, Q, G, FP, C]
-
-# ---- 改进: 额外返回 frame_validity ----
-
-# valid_mask 在 argmax 选择最佳视角后: [B, T, Q, G*P, 1]
-valid_mask = valid_mask.squeeze(-1)                       # [B, T, Q, G*P]
-valid_mask = valid_mask.reshape(B, T, Q, G, P)            # [B, 8, Q, 4, 4]
-valid_mask = valid_mask.permute(0, 2, 3, 1, 4)           # [B, Q, 4, 8, 4]
-frame_validity = valid_mask.mean(dim=-1)                  # [B, Q, 4, 8]
-# 含义: 每帧中有效采样点(落在图像内)的比例
-# 值域: [0.0, 1.0]
-# 0.0 = 该帧所有4个采样点都在图像外
-# 1.0 = 该帧所有4个采样点都在图像内
-
-return final, frame_validity
-# final:          [B, Q, G, F*P, C_g] = [B, Q, 4, 32, 64]
-# frame_validity: [B, Q, G, F]        = [B, Q, 4, 8]
+query_ctx [B,Q,1,H] + motion_ctx [B,Q,F,H]
+  -> broadcast add
+  -> ReLU
+  -> scale_ctx [B,Q,F,H]
+  -> Linear(H, G*Ppf*L)
+  -> reshape / permute / softmax(L)
+  -> scale_weights [B,Q,G,F,Ppf,L]
 ```
 
-**张量维度变换**：
-```
-valid_mask [B, T, Q, GP, 1]
-  → squeeze(-1) → [B, T, Q, GP]       = [B, 8, 900, 16]
-  → reshape     → [B, T, Q, G, P]     = [B, 8, 900, 4, 4]
-  → permute     → [B, Q, G, T, P]     = [B, 900, 4, 8, 4]
-  → mean(dim=-1)→ [B, Q, G, T]        = [B, 900, 4, 8]
-```
+#### 4.1.4 为什么这里是“直接替代”而不是“原 logits 上加 bias”
 
----
+当前你的目标已经从“给原始 scale 逻辑做一点修正”变成了：
 
-### 3.3 AdaptiveMixing —— 连续时序位置编码
+- 让尺度选择同时由 `query_feat`、时间、距离、尺寸共同决定
 
-#### 3.3.1 新增参数
+这时如果还保留旧的 `scale_weights(query_feat)` 当主干，再额外加一个 bias，模型会天然更依赖旧路径；而现在直接用 `scale_ctx -> scale_weights_head`，就等于把“尺度选择”这件事完整交给条件化后的上下文去做，更符合你的设计目标。
 
-```python
-# 替代原始的 nn.Embedding(num_frames, eff_in_dim)
-# 使用连续 MLP 编码器: 1 → 16 → C_g
-self.temporal_pos_encoder = nn.Sequential(
-    nn.Linear(1, 16),           # 参数: 1×16 + 16 = 32
-    nn.ReLU(inplace=True),
-    nn.Linear(16, 64),          # 参数: 16×64 + 64 = 1,088
-)                                # 总参数: 1,120
-# 初始化: 第二层(nn.Linear(16,64)) weight=zeros, bias=zeros
-# 效果: 初始时编码器输出全零向量，不干扰原始特征
-```
+### 4.2 Temporal 分支
 
-#### 3.3.2 新增参数：num_frames
+目标：
 
-```python
-def __init__(self, in_dim, in_points, n_groups=1, ..., num_frames=8):
-    self.num_frames = num_frames                      # 8
-    self.points_per_frame = in_points // num_frames   # 32 // 8 = 4
+- 根据 query 自身语义、真实时间距离、物体速度，给每个 frame 生成可信度权重。
+
+核心设计：
+
+- 不再只根据 `query_feat` 输出“固定 frame slot 权重”。
+- 改成先构造 `temporal_ctx`，再输出每个 group 在每个 frame 上的 logits。
+
+#### 4.2.1 输入量
+
+```text
+query_feat : [B, Q, C]
+time_diff  : [B, F]
+vel        : [B, Q, 2]
 ```
 
-#### 3.3.3 接口变更
+其中：
 
-```python
-# 原始: def forward(self, x, query)
-# 改进: def forward(self, x, query, time_diff=None)
+- `vel` 是 `query_bbox[..., 8:10]`，单位 m/s
+- 分支里实际用的是 `speed = ||vel||_2`
+
+#### 4.2.2 张量流
+
+```text
+query_feat [B,Q,C]
+  -> temporal_query_proj
+  -> [B,Q,H]
+  -> unsqueeze(2)
+  -> query_ctx [B,Q,1,H]
+
+time_diff [B,F]
+  -> abs
+  -> [B,1,F,1]
+  -> expand
+  -> td_abs [B,Q,F,1]
+
+vel [B,Q,2]
+  -> norm(dim=-1)
+  -> speed [B,Q,1]
+  -> unsqueeze(2) + expand
+  -> [B,Q,F,1]
+
+cat([td_abs, speed], dim=-1)
+  -> temporal_desc [B,Q,F,2]
+  -> temporal_motion_encoder
+  -> [B,Q,F,H]
+
+query_ctx [B,Q,1,H]
+  + motion_ctx [B,Q,F,H]
+  -> broadcast add
+  -> [B,Q,F,H]
+  -> ReLU
+  -> temporal_ctx [B,Q,F,H]
+
+temporal_ctx [B,Q,F,H]
+  -> temporal_refine
+  -> [B,Q,F,G]
+  -> permute
+  -> [B,Q,G,F]
+  -> softmax(dim=F) * F
+  -> temporal_weights [B,Q,G,F]
+  -> expand to points
+  -> [B,Q,G,FP,1]
+  -> sampled_feats *= temporal_weights
 ```
 
-#### 3.3.4 inner_forward 中的计算
+#### 4.2.3 ASCII 结构图
 
-```python
-def inner_forward(self, x, query, time_diff=None):
-    B, Q, G, P, C = x.shape
-    # x: [B, Q, 4, 32, 64]  (G=4, F*P=32, C_g=64)
+```text
+                        +------------------------+
+query_feat [B,Q,C] ---->| temporal_query_proj    |----+
+                        +------------------------+    |
+                                                      v
+                                                query_ctx
+                                                [B,Q,1,H]
 
-    if time_diff is not None:
-        # time_diff: [B, F] = [B, 8]
-        td = time_diff.mean(dim=0, keepdim=False)    # [F] = [8]     取batch均值
-        td = td.unsqueeze(-1)                         # [F, 1] = [8, 1]
+time_diff [B,F] -- abs -- expand ----------------------+
+vel [B,Q,2] -- norm -- expand -------------------------+--> cat --> temporal_desc [B,Q,F,2]
 
-        temp_pos = self.temporal_pos_encoder(td)       # [8, 1] → Linear(1,16) → ReLU
-                                                        # → Linear(16,64) → [8, 64]
+temporal_desc [B,Q,F,2]
+  -> Linear(2,H)
+  -> ReLU
+  -> Linear(H,H)
+  -> motion_ctx [B,Q,F,H]
 
-        temp_pos = temp_pos.unsqueeze(1)               # [8, 1, 64]
-        temp_pos = temp_pos.expand(F, P_per_frame, C)  # [8, 4, 64]
-        temp_pos = temp_pos.reshape(1, 1, 1, P, C)     # [1, 1, 1, 32, 64]
-
-        x = x + temp_pos                               # [B,Q,4,32,64] + [1,1,1,32,64]
-                                                         # broadcast → [B, Q, 4, 32, 64]
-    # ... 后续 channel mixing + point mixing 不变
+query_ctx [B,Q,1,H] + motion_ctx [B,Q,F,H]
+  -> broadcast add
+  -> ReLU
+  -> temporal_ctx [B,Q,F,H]
+  -> Linear(H,G)
+  -> logits [B,Q,F,G]
+  -> permute -> [B,Q,G,F]
+  -> softmax(F) * F
+  -> temporal_weights [B,Q,G,F]
+  -> expand to [B,Q,G,FP,1]
+  -> reweight sampled_feats
 ```
 
-**张量流**：
-```
-time_diff [B, 8]
-  → mean(dim=0) → [8]
-  → unsqueeze(-1) → [8, 1]
-  → Linear(1→16) → ReLU → Linear(16→64) → [8, 64]
-  → unsqueeze(1) → [8, 1, 64]
-  → expand → [8, 4, 64]
-  → reshape → [1, 1, 1, 32, 64]
-  → + x [B, Q, 4, 32, 64]  (broadcast)
-```
+#### 4.2.4 `softmax(F) * F` 的含义
 
-#### 3.3.5 残差连接移除
+原始等权融合下，每帧等效权重是 `1`。  
+如果直接 softmax，所有帧权重和为 `1`，总幅值会缩小为原来的 `1/F`。
 
-```python
-# 原始:
-out = self.out_proj(out)    # [B, Q, 256]
-out = query + out            # 残差连接
+因此现在做的是：
 
-# 改进:
-out = self.out_proj(out)    # [B, Q, 256]
-# 不做残差，返回纯增量
-return out                   # [B, Q, 256]  (mixing_delta)
+```text
+softmax(F 维) 后再乘 F
 ```
 
----
+这样当 logits 全为 0 时：
 
-### 3.4 SparseBEVTransformerDecoderLayer —— 运动自适应门控
-
-#### 3.4.1 新增参数
-
-```python
-self.motion_gate = nn.Sequential(
-    nn.Linear(2, 32),           # 参数: 2×32 + 32 = 96
-    nn.ReLU(inplace=True),
-    nn.Linear(32, 256),         # 参数: 32×256 + 256 = 8,448
-    nn.Sigmoid()                # 输出值域: (0, 1)
-)                                # 总参数: 8,544
+```text
+softmax([0, ..., 0]) = [1/F, ..., 1/F]
+乘 F 后变成 [1, ..., 1]
 ```
 
-#### 3.4.2 初始化策略
+所以零初始化时可以退化回原始“各帧等权”的幅值。
 
-```python
-# 目标: 初始时 gate ≈ 0.88，接近原始完整残差连接
-nn.init.zeros_(self.motion_gate[0].weight)    # Linear(2,32).weight = 0
-nn.init.zeros_(self.motion_gate[0].bias)      # Linear(2,32).bias = 0
-nn.init.zeros_(self.motion_gate[2].weight)    # Linear(32,256).weight = 0
-nn.init.constant_(self.motion_gate[2].bias, -2.0)  # Linear(32,256).bias = -2.0
+### 4.3 Mixing 分支
 
-# 计算过程 (任意输入 vel):
-# layer1: 0*vel + 0 = [0,...,0] (32维)
-# ReLU: [0,...,0]
-# layer2: 0*[0,...,0] + (-2.0) = [-2.0,...,-2.0] (256维)
-# Sigmoid: sigmoid(-2.0) = 0.119
-# gate = 1.0 - 0.119 = 0.881 ≈ 0.88
+目标：
+
+- 在点级别告诉 `AdaptiveMixing`：这个点离当前有多远、这个点本身相对 query 中心偏了多少。
+- 让 point mixing 不再把 `F * Ppf` 个点当成纯平铺序列，而是显式知道时间和空间关系。
+
+核心设计：
+
+- 不再输入 `vx*t, vy*t`
+- 也不再用 batch 内均值时间差
+- 直接对每个样本使用真实 `|dt|`，并拼接每个采样点相对 query center 的 3D 偏移
+
+#### 4.3.1 `point_offset` 是什么
+
+在 `SparseBEVSampling` 里先算：
+
+```text
+sampling_points_current = make_sample_points(query_bbox, sampling_offset)
+query_center            = decode_bbox(query_bbox)[..., :3]
+point_offset            = sampling_points_current - query_center
 ```
 
-#### 3.4.3 forward 中的计算
+shape:
 
-```python
-# ---- 原始 ----
-query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
-
-# ---- 改进 ----
-# 1. mixing 返回纯增量 (无残差)
-mixing_delta = self.mixing(sampled_feat, query_feat, img_metas[0]['time_diff'])
-# mixing_delta: [B, Q, 256]
-
-# 2. 运动自适应门控
-vel = query_bbox[..., 8:10].detach()          # [B, Q, 2]      单位: m/s, 无梯度
-gate_raw = self.motion_gate(vel)               # [B, Q, 2] → [B, Q, 256]  值域: (0,1)
-gate = 1.0 - gate_raw                          # [B, Q, 256]
-# 速度大 → gate_raw 大 → gate 小 → 减弱多帧融合增量
-# 速度小 → gate_raw 小 → gate 大 → 充分利用多帧融合
-
-# 3. 门控残差连接
-query_feat = self.norm2(
-    query_feat + gate * mixing_delta            # [B,Q,256] + [B,Q,256]*[B,Q,256]
-)                                                # LayerNorm → [B, Q, 256]
+```text
+point_offset : [B,Q,G*Ppf,3]
 ```
 
-**张量流**：
-```
-vel [B,Q,2] → Linear(2,32) → ReLU → Linear(32,256) → Sigmoid → [B,Q,256]
-  → 1.0 - (·) → gate [B,Q,256]
+然后扩展到所有 frame，并整理成：
 
-mixing_delta [B,Q,256]
-  → × gate [B,Q,256] → [B,Q,256]
-  → + query_feat [B,Q,256]
-  → LayerNorm → [B,Q,256]
+```text
+point_offset : [B,Q,G,FP,3]
 ```
 
----
+这里虽然每个 frame 都复用了同一个 `point_offset`，但这是合理的，因为 warp 时采样点和 box center 都做了同样的平移 `dist = vel * dt`，所以“点相对中心的局部偏移”在各个 frame 上本来就不变。
 
-## 四、参数量统计
+#### 4.3.2 张量流
 
-### 4.1 逐项明细
+`AdaptiveMixing` 的输入：
 
-| 模块 | 参数名 | 形状 | 参数量 | 初始化 |
-|------|--------|------|--------|--------|
-| SparseBEVSampling | temporal_scale_bias | [8, 4] | 32 | zeros |
-| SparseBEVSampling | temporal_refine.weight | [32, 256] | 8,192 | zeros |
-| SparseBEVSampling | temporal_refine.bias | [32] | 32 | zeros |
-| SparseBEVSampling | velocity_correction.weight | [16, 256] | 4,096 | zeros |
-| SparseBEVSampling | velocity_correction.bias | [16] | 16 | zeros |
-| AdaptiveMixing | temporal_pos_encoder[0].weight | [16, 1] | 16 | default (kaiming) |
-| AdaptiveMixing | temporal_pos_encoder[0].bias | [16] | 16 | default (zeros) |
-| AdaptiveMixing | temporal_pos_encoder[2].weight | [64, 16] | 1,024 | zeros |
-| AdaptiveMixing | temporal_pos_encoder[2].bias | [64] | 64 | zeros |
-| DecoderLayer | motion_gate[0].weight | [32, 2] | 64 | zeros |
-| DecoderLayer | motion_gate[0].bias | [32] | 32 | zeros |
-| DecoderLayer | motion_gate[2].weight | [256, 32] | 8,192 | zeros |
-| DecoderLayer | motion_gate[2].bias | [256] | 256 | constant(-2.0) |
-| **总计** | | | **22,032** | |
-
-### 4.2 占比分析
-
-- 原始 Decoder Layer 参数量: ~2.8M
-- 新增参数量: 22,036
-- **占比: ~0.79%**
-
-> 注: Decoder Layer 参数在 6 层间共享，新增参数同样共享。
-
----
-
-## 五、计算量 (FLOPs) 估算
-
-以单次 decoder layer forward、单 query 为单位：
-
-| 操作 | 算子 | 维度 | FLOPs |
-|------|------|------|-------|
-| velocity_correction | Linear(256→16) | [1,256]×[256,16] | 8,192 |
-| tanh | 逐元素 | [1,16] | 16 |
-| td_mask 乘法 | 逐元素 | [1,8,2] | 16 |
-| temporal_scale_bias 加法 | 逐元素 | [4,8,4,4] | 512 |
-| softmax (scale_weights) | 已存在，不算增量 | — | 0 |
-| exp(-rate*t) | — | — | ~~已删除~~ |
-| temporal_refine | Linear(256→32) + softmax | [1,256]×[256,32] | 16,384 |
-| sampled_feats 加权 | 逐元素 | [4,32,64] | 8,192 |
-| temporal_pos_encoder | Linear(1→16→64) | [8,1]→[8,16]→[8,64] | ~1,280 |
-| 加法 (x + temp_pos) | 逐元素 | [4,32,64] | 8,192 |
-| motion_gate | Linear(2→32→256) | [1,2]→[1,32]→[1,256] | ~8,320 |
-| sigmoid | 逐元素 | [1,256] | 256 |
-| gate 乘法 + 加法 | 逐元素 | [1,256]×2 | 512 |
-| **总计** | | | **~52,096** |
-
-原始 decoder layer 单 query FLOPs 估算:
-- Self-Attention: ~Q×C = 900×256 ≈ 230K (简化)
-- AdaptiveMixing parameter_generator: 256 × (4×(64×64+32×128)) ≈ 86K → FLOPs 同量级
-- channel/point mixing: 矩阵乘法为主 ≈ 数百K
-- 保守估计原始 per-query FLOPs ≈ 500K~1M
-
-**新增 ~52K FLOPs/query ≈ 5~10%，考虑全局操作摊薄后实际 < 5%。**
-
----
-
-## 六、数值范围与稳定性分析
-
-| 变量 | 值域 | 保护措施 |
-|------|------|---------|
-| query_temporal_w (logits) | (-∞, +∞) | 零初始化→初始全零→softmax均匀 |
-| validity_mask | (-13.8, 0] | log(fv+1e-6)，无效帧→大负值 |
-| temporal_weights (softmax后×F) | 每帧 ≥ 0, sum=F | softmax 天然归一化 |
-| frame_validity | [0, 1] | valid_mask 是 float，mean 不超 1 |
-| fv[:,:,:,0] (当前帧) | [0.1, 1] | clamp(min=0.1) 保护 |
-| vel_correction | [-2.0, 2.0] 米 | tanh 硬约束 |
-| vel_correction (当前帧) | 0.0 | td_mask 屏蔽 |
-| motion_gate 输出 | (0, 1) | Sigmoid |
-| gate (1-motion_gate) | (0, 1) | 1-Sigmoid |
-| gate (初始) | ≈ 0.88 | bias=-2.0 初始化 |
-| temp_pos (初始) | [0,...,0] | 输出层零初始化 |
-
----
-
-## 七、初始化行为分析
-
-### 7.1 训练开始时的等效行为
-
-由于所有新增模块均采用零初始化（或使初始输出接近原始行为），**训练开始时改进模型等效于原始模型**：
-
-| 模块 | 初始行为 |
-|------|---------|
-| velocity_correction | 输出全零 → 不修正线性补偿 |
-| temporal_refine | 输出全零 → softmax均匀 → 每帧权重=1.0（原始等权行为） |
-| temporal_pos_encoder | 输出全零 → 不注入位置信息 |
-| motion_gate | gate≈0.88 → 接近完整残差连接 |
-| temporal_scale_bias | 全零 → 所有帧共享相同尺度权重（原始行为） |
-
-### 7.2 训练过程中的学习方向
-
-| 模块 | 学习内容 |
-|------|---------|
-| velocity_correction | 学习对非匀速运动的采样点位移修正 |
-| temporal_refine | 学习每个 query 对各帧的关注程度（取代全局衰减） |
-| temporal_pos_encoder | 学习将真实时间差映射为有区分性的位置编码 |
-| motion_gate | 学习高速物体减弱时序融合，低速物体增强 |
-| temporal_scale_bias | 学习远帧偏好低分辨率层、近帧偏好高分辨率层 |
-| temporal_decay_rate | 学习最优的全局时序衰减速率 |
-
----
-
-## 八、与原始模型的 diff 摘要
-
-### 8.1 `models/sparsebev_sampling.py`
-
-```diff
-  # 函数末尾
-- return final
-+ # 计算 frame_validity
-+ valid_mask = valid_mask.squeeze(-1)
-+ valid_mask = valid_mask.reshape(B, T, Q, G, P)
-+ valid_mask = valid_mask.permute(0, 2, 3, 1, 4)
-+ frame_validity = valid_mask.mean(dim=-1)
-+ return final, frame_validity
+```text
+x           : [B,Q,G,FP,C_g]
+query       : [B,Q,C]
+time_diff   : [B,F]
+point_offset: [B,Q,G,FP,3]
 ```
 
-### 8.2 `models/sparsebev_transformer.py`
+位置编码分支：
 
-**SparseBEVSampling.__init__**: +4 个参数/层
-**SparseBEVSampling.init_weights**: +2 个零初始化
-**SparseBEVSampling.inner_forward**: +速度修正、+尺度偏置、+时序权重计算
-**AdaptiveMixing.__init__**: +temporal_pos_encoder, +num_frames, +points_per_frame
-**AdaptiveMixing.init_weights**: +编码器零初始化
-**AdaptiveMixing.inner_forward**: +连续时序编码, -残差连接, +time_diff 参数
-**AdaptiveMixing.forward**: +time_diff 参数
-**DecoderLayer.__init__**: +motion_gate
-**DecoderLayer.init_weights**: +motion_gate 初始化
-**DecoderLayer.forward**: +门控残差逻辑, mixing 调用传 time_diff
+```text
+time_diff [B,F]
+  -> abs
+  -> td_abs [B,F]
+  -> reshape / expand
+  -> td_per_point [B,Q,G,FP,1]
 
----
+point_offset [B,Q,G,FP,3]
 
-## 九、配置兼容性
+cat([td_per_point, point_offset], dim=-1)
+  -> pos_desc [B,Q,G,FP,4]
+  -> temporal_pos_encoder
+  -> temp_pos [B,Q,G,FP,C_g]
 
-| 配置项 | 是否需要修改 | 说明 |
-|--------|-------------|------|
-| `r50_nuimg_704x256.py` | 不需要 | 所有新参数通过已有的 num_frames/num_points/etc 自动推导 |
-| `vit_eva02_1600x640_trainval_future.py` | 不需要 | num_frames=15 时所有新参数自动适配 |
-| `vov99_dd3d_1600x640_trainval_future.py` | 不需要 | 同上 |
-| 预训练权重加载 | 需 strict=False | 忽略新增参数的缺失 |
+x [B,Q,G,FP,C_g] + temp_pos [B,Q,G,FP,C_g]
+  -> x_cond [B,Q,G,FP,C_g]
+```
+
+后续 mixing 主体：
+
+```text
+query [B,Q,C]
+  -> parameter_generator
+  -> [B,Q,G*(C_g*C_g + FP*out_points)]
+  -> reshape
+  -> params [B*Q,G,*]
+  -> split
+     M: [B*Q,G,C_g,C_g]
+     S: [B*Q,G,out_points,FP]
+
+x_cond [B,Q,G,FP,C_g]
+  -> reshape -> [B*Q,G,FP,C_g]
+  -> matmul with M
+  -> [B*Q,G,FP,C_g]
+  -> layer_norm over [FP,C_g]
+  -> ReLU
+  -> matmul with S
+  -> [B*Q,G,out_points,C_g]
+  -> layer_norm over [out_points,C_g]
+  -> ReLU
+  -> reshape [B,Q,*]
+  -> out_proj
+  -> [B,Q,C]
+  -> residual add with query
+```
+
+#### 4.3.3 ASCII 结构图
+
+```text
+x [B,Q,G,FP,C_g] ----------------------------------------------+
+                                                                |
+time_diff [B,F] -- abs -- expand --> td_per_point [B,Q,G,FP,1] |
+point_offset [B,Q,G,FP,3] -------------------------------------+--> cat
+                                                                   |
+                                                                   v
+                                                            pos_desc [B,Q,G,FP,4]
+                                                                   |
+                                                            temporal_pos_encoder
+                                                                   |
+                                                            temp_pos [B,Q,G,FP,C_g]
+                                                                   |
+                                           x + temp_pos -----------+
+                                                                   v
+                                                            x_cond [B,Q,G,FP,C_g]
+
+query [B,Q,C]
+  -> parameter_generator
+  -> params
+  -> split into:
+     M [B*Q,G,C_g,C_g]
+     S [B*Q,G,out_points,FP]
+
+x_cond [B*Q,G,FP,C_g]
+  -> matmul(M) -> channel mixing
+  -> LayerNorm + ReLU
+  -> matmul(S) -> point mixing
+  -> LayerNorm + ReLU
+  -> out_proj
+  -> + query
+  -> [B,Q,C]
+```
+
+## 5. 三个分支怎样和原模型对齐
+
+### 5.1 原始 scale 逻辑
+
+原始版本更接近：
+
+```text
+scale_weights = Linear(query_feat)
+```
+
+也就是：
+
+- 同一个 query 在所有 frame 上共享一套 level 偏好
+- frame 维只是在后面被 expand 出来
+
+当前版本改成：
+
+```text
+scale_weights = Head(scale_ctx(query_feat, |dt|, range_t, size))
+```
+
+所以现在的尺度选择真正变成了“逐 frame 决策”。
+
+### 5.2 原始 temporal 逻辑
+
+原始版本更接近：
+
+```text
+temporal_weights = Linear(query_feat)
+```
+
+所以它容易学成：
+
+- 第 1 帧应该怎样
+- 第 2 帧应该怎样
+- 第 3 帧应该怎样
+
+但不一定对应真实时间间隔。
+
+当前版本改成：
+
+```text
+temporal_weights = Head(temporal_ctx(query_feat, |dt|, speed))
+```
+
+所以同一个 frame slot 在不同样本里只要真实 `|dt|` 不一样，权重也可以不一样。
+
+### 5.3 原始 mixing 逻辑
+
+你当前这一轮之前的版本更接近：
+
+```text
+pos_desc = [t, vx*t, vy*t]
+```
+
+而且时间差还取了 batch 均值。
+
+现在改成：
+
+```text
+pos_desc = [|dt|, dx, dy, dz]
+```
+
+这样变化是：
+
+- 时间用每个样本自己的真实值
+- 运动方向不再由可能不准的 velocity correction 来承担
+- 点的局部几何关系由采样点偏移直接表达
+
+## 6. 为什么 `temporal_ctx` 和 `scale_ctx` 用“加法融合”
+
+两者现在的骨架都是：
+
+```text
+ctx = ReLU(query_proj(query_feat) + desc_encoder(desc))
+```
+
+这里的“加法”不是把原始输出硬加到最终 logits 上，而是：
+
+- 先把 `query_feat` 投到一个 `H=16` 的隐藏空间
+- 再把条件描述符 `desc` 编到同一个隐藏空间
+- 让两者在隐藏空间相加
+- 最后再由输出头把 `ctx` 读成 logits
+
+也就是说，真正的 logits 仍然是后面那层线性头产生的：
+
+```text
+logit = W_o * ctx + b
+```
+
+这类设计的优点是：
+
+- 计算量小
+- 初始化稳定
+- 条件变量和 query 语义能在同一个低维空间里做交互
+
+对于你现在这两个任务：
+
+- 帧可信度分配
+- FPN 层选择
+
+这种轻量条件化通常已经够用。
+
+## 7. 初始化与训练起点
+
+当前初始化里最关键的是 3 件事：
+
+### 7.1 `temporal_refine` 零初始化
+
+```text
+temporal_refine.weight = 0
+temporal_refine.bias   = 0
+```
+
+因此初始时：
+
+```text
+query_temporal_w = 0
+softmax = uniform
+softmax * F = 1
+```
+
+即：
+
+- 初始时各 frame 等权
+- 不会在训练一开始把原模型的时序幅值打乱
+
+### 7.2 `scale_weights_head` 零初始化
+
+```text
+scale_weights_head.weight = 0
+scale_weights_head.bias   = 0
+```
+
+因此初始时：
+
+```text
+scale logits = 0
+softmax(level) = uniform
+```
+
+即：
+
+- 初始时所有 FPN level 等权
+- 与原始模型“没有明确偏置”的中性起点一致
+
+### 7.3 `temporal_pos_encoder` 最后一层零初始化
+
+```text
+temporal_pos_encoder[-1].weight = 0
+temporal_pos_encoder[-1].bias   = 0
+```
+
+因此初始时：
+
+```text
+temp_pos = 0
+x + temp_pos = x
+```
+
+即：
+
+- mixing 分支新增的位置编码一开始不影响原特征
+- 模型可以从原行为平滑过渡到新行为
+
+## 8. 目前我认为“合理”的地方
+
+### 8.1 三个分支各自负责不同问题
+
+- `scale`：负责“去哪一层采样”
+- `temporal`：负责“哪一帧更可信”
+- `mixing`：负责“点和点之间的时空几何关系”
+
+这个拆分比把所有条件全塞进一个大头里更清楚，也更轻量。
+
+### 8.2 物理量和学习量的边界更清楚了
+
+当前流程里：
+
+- 物理平移补偿：`dist = vel * dt`
+- 学习时序权重：`temporal_ctx`
+- 学习尺度选择：`scale_ctx`
+- 学习点间位置编码：`pos_desc`
+
+这样做的好处是：
+
+- 不把“几何传播”完全交给网络猜
+- 也不把“可信度分配”和“尺度偏好”硬编码成固定规则
+
+### 8.3 对随机时间间隔训练更友好
+
+因为现在：
+
+- temporal 分支看 `|dt|`
+- scale 分支看 `|dt|`
+- mixing 分支也看 `|dt|`
+
+所以三段时序建模的归因是一致的，不会出现前面按 frame slot、后面按真实时间的冲突。
+
+## 9. 目前我认为值得持续观察的点
+
+这些不算已经确定的错误，但建议后面训练时重点看：
+
+### 9.1 `speed` 是否需要轻度压缩
+
+现在 `speed = ||v||_2` 直接喂入 `temporal_motion_encoder`。  
+如果数据里速度分布跨度比较大，后面可以尝试：
+
+```text
+speed_feat = log1p(speed)
+```
+
+或者做简单 clipping。
+
+### 9.2 `|dt|` 去掉了方向信息
+
+这是你当前明确想要的行为，也和“只看离当前多远”一致。  
+但如果将来你做未来帧预测，或者发现在历史帧和未来帧上行为应当不同，这里会是第一个需要恢复 signed `dt` 的地方。
+
+### 9.3 `range_t` 用的是 BEV 距离
+
+当前定义：
+
+```text
+range_t = sqrt(x_t^2 + y_t^2)
+```
+
+对尺度选择我认为是合理的，但如果你后面希望更贴近透视投影，也可以把：
+
+- 相机深度
+- 多相机可见性
+- z 高度
+
+加入 scale 分支。不过那会让结构更重。
+
+## 10. 一句话总结当前结构
+
+```text
+scale    = query 语义 + 时间距离 + 传播后距离 + 物体尺寸
+temporal = query 语义 + 时间距离 + 物体速度
+mixing   = 时间距离 + 采样点局部偏移
+```
+
+这三者当前的职责划分、张量流和初始化策略，整体上是合理的。

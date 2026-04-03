@@ -161,18 +161,17 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
     def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
         """
-        query_bbox: [B, Q, 10] [cx, cy, cz, w, h, d, rot.sin, rot.cos, vx, vy]
+        query_bbox: [B, Q, 10] [cx, cy, cz, log_w, log_l, log_h, rot.sin, rot.cos, vx, vy]
         """
         query_pos = self.position_encoder(query_bbox[..., :3])
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat, point_offset = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
 
-        # 将速度和时间差传给 mixing，用于运动感知的时序位置编码
-        vel = query_bbox[..., 8:10].detach()       # [B, Q, 2]  m/s
+        # 将采样点偏移和时间差传给 mixing，用于点级别的时序几何位置编码
         time_diff = img_metas[0]['time_diff']       # [B, F]     秒
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, time_diff, vel))
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, time_diff, point_offset))
 
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -263,34 +262,96 @@ class SparseBEVSampling(BaseModule):
         self.num_groups = num_groups
         self.num_levels = num_levels
         self.pc_range = pc_range
+        self.temporal_context_dim = 16
 
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
-        self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
 
-        # 查询驱动的时序尺度偏置
-        # 每个query根据自身特征为不同帧生成不同的FPN层偏好
-        # 输入: query_feat [B,Q,C] → 输出: [B,Q,F*L] → view [B,Q,F,L]
-        self.temporal_scale_bias = nn.Linear(embed_dims, num_frames * num_levels)
+        # 共享的时序描述编码器
+        # 输入: [|dt|, speed]
+        # 只关心离当前多远和运动速度，不区分过去/未来方向与速度方向
+        self.temporal_query_proj = nn.Linear(embed_dims, self.temporal_context_dim)
+        self.temporal_motion_encoder = nn.Sequential(
+            nn.Linear(2, self.temporal_context_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.temporal_context_dim, self.temporal_context_dim),
+        )
+        self.temporal_act = nn.ReLU(inplace=True)
 
-        # [Round 4] Query-Adaptive Temporal Refinement
-        # 让每个query根据自身特征微调时序权重（轻量：仅一层线性+sigmoid）
-        self.temporal_refine = nn.Linear(embed_dims, num_groups * num_frames)
+        # 尺度偏置单独使用 size + distance-to-current 的 context
+        self.scale_query_proj = nn.Linear(embed_dims, self.temporal_context_dim)
+        self.scale_motion_encoder = nn.Sequential(
+            nn.Linear(5, self.temporal_context_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.temporal_context_dim, self.temporal_context_dim),
+        )
+        self.scale_act = nn.ReLU(inplace=True)
 
-        # [Round 9] 自适应速度补偿残差修正
-        # 学习对线性 v*Δt 补偿的非线性修正（加减速、转弯场景）
-        # 输入：query特征 → 输出：每帧的 2D 位移修正量
-        self.velocity_correction = nn.Linear(embed_dims, num_frames * 2)
+        # 两个轻量输出头
+        # scale 分支直接生成完整的 [G, P, L] logits，替代原始 scale_weights(query_feat)
+        self.scale_weights_head = nn.Linear(
+            self.temporal_context_dim,
+            num_groups * num_points * num_levels,
+        )
+        self.temporal_refine = nn.Linear(self.temporal_context_dim, num_groups)
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+        nn.init.zeros_(self.temporal_motion_encoder[-1].bias)
+        nn.init.zeros_(self.scale_motion_encoder[-1].bias)
         nn.init.zeros_(self.temporal_refine.weight)
         nn.init.zeros_(self.temporal_refine.bias)
-        nn.init.zeros_(self.velocity_correction.weight)
-        nn.init.zeros_(self.velocity_correction.bias)
-        nn.init.zeros_(self.temporal_scale_bias.weight)
-        nn.init.zeros_(self.temporal_scale_bias.bias)
+        nn.init.zeros_(self.scale_weights_head.weight)
+        nn.init.zeros_(self.scale_weights_head.bias)
+
+    def build_temporal_context(self, query_feat, time_diff, vel):
+        '''
+        query_feat: [B, Q, C]
+        time_diff: [B, F]
+        vel: [B, Q, 2] absolute velocity in m/s
+        return: [B, Q, F, H]
+        '''
+        B, Q = query_feat.shape[:2]
+        T = time_diff.shape[1]
+        assert T == self.num_frames
+
+        td_abs = time_diff.to(dtype=query_feat.dtype).abs()[:, None, :, None]  # [B, 1, F, 1]
+        td_abs = td_abs.expand(B, Q, T, 1)  # [B, Q, F, 1]
+
+        speed = torch.norm(vel.to(dtype=query_feat.dtype), dim=-1, keepdim=True)  # [B, Q, 1]
+        speed = speed[:, :, None, :].expand(B, Q, T, 1)  # [B, Q, F, 1]
+
+        temporal_desc = torch.cat([td_abs, speed], dim=-1)  # [B, Q, F, 2]
+        temporal_ctx = self.temporal_motion_encoder(temporal_desc)  # [B, Q, F, H]
+        query_ctx = self.temporal_query_proj(query_feat)[:, :, None, :]  # [B, Q, 1, H]
+        temporal_ctx = self.temporal_act(query_ctx + temporal_ctx)
+
+        return temporal_ctx
+
+    def build_scale_context(self, query_feat, time_diff, range_t, size_log):
+        '''
+        query_feat: [B, Q, C]
+        time_diff: [B, F]
+        range_t: [B, Q, F, 1] BEV distance to origin after motion propagation
+        size_log: [B, Q, 3] log object size
+        return: [B, Q, F, H]
+        '''
+        B, Q = query_feat.shape[:2]
+        T = time_diff.shape[1]
+        assert T == self.num_frames
+
+        td_abs = time_diff.to(dtype=query_feat.dtype).abs()[:, None, :, None]  # [B, 1, F, 1]
+        td_abs = td_abs.expand(B, Q, T, 1)  # [B, Q, F, 1]
+        range_feat = torch.log1p(range_t.to(dtype=query_feat.dtype))  # [B, Q, F, 1]
+        size_feat = size_log.to(dtype=query_feat.dtype)[:, :, None, :].expand(B, Q, T, 3)  # [B, Q, F, 3]
+
+        scale_desc = torch.cat([td_abs, range_feat, size_feat], dim=-1)  # [B, Q, F, 5]
+        scale_ctx = self.scale_motion_encoder(scale_desc)  # [B, Q, F, H]
+        query_ctx = self.scale_query_proj(query_feat)[:, :, None, :]  # [B, Q, 1, H]
+        scale_ctx = self.scale_act(query_ctx + scale_ctx)
+
+        return scale_ctx
 
     def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         '''
@@ -299,34 +360,32 @@ class SparseBEVSampling(BaseModule):
         '''
         B, Q = query_bbox.shape[:2]
         image_h, image_w, _ = img_metas[0]['img_shape'][0]
+        time_diff_raw = img_metas[0]['time_diff']  # [B, F]
+        num_frames = time_diff_raw.shape[1]
+        assert num_frames == self.num_frames
 
         # sampling offset of all frames
         sampling_offset = self.sampling_offset(query_feat)
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
         sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
+        query_center = decode_bbox(query_bbox, self.pc_range)[..., 0:3]  # [B, Q, 3]
+        point_offset = sampling_points - query_center[:, :, None, :]  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
+        point_offset = point_offset.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
+        point_offset = point_offset.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
         # warp sample points based on velocity
-        time_diff = img_metas[0]['time_diff']  # [B, F]
+        time_diff = time_diff_raw  # [B, F]
         time_diff = time_diff[:, None, :, None]  # [B, 1, F, 1]
-        vel = query_bbox[..., 8:].detach()  # [B, Q, 2]
-        vel = vel[:, :, None, :]  # [B, Q, 1, 2]
+        vel_base = query_bbox[..., 8:].detach()  # [B, Q, 2]
+        size_log = query_bbox[..., 3:6].detach()  # [B, Q, 3]
+        vel = vel_base[:, :, None, :]  # [B, Q, 1, 2]
         dist = vel * time_diff  # [B, Q, F, 2]
-
-        # [Round 9] 自适应速度补偿残差修正
-        # 基于query特征学习对线性补偿的修正（捕获加减速/转弯）
-        vel_correction = self.velocity_correction(query_feat)  # [B, Q, F*2]
-        vel_correction = vel_correction.view(B, Q, self.num_frames, 2)  # [B, Q, F, 2]
-        # 修正量用tanh约束范围，世界坐标系（米）下
-        # 最大±2米，覆盖典型加减速/转弯的线性补偿误差
-        vel_correction = torch.tanh(vel_correction) * 2.0
-        # [Round 12] 当前帧(time_diff=0)不需要修正，用time_diff绝对值作为mask
-        # time_diff_abs越大表示越远的帧，修正量越有意义
-        td_mask = img_metas[0]['time_diff'].abs()  # [B, F]
-        td_mask = (td_mask > 1e-5).float()[:, None, :, None]  # [B, 1, F, 1]
-        vel_correction = vel_correction * td_mask
-        dist = dist + vel_correction
+        temporal_ctx = self.build_temporal_context(query_feat, time_diff_raw, vel_base)
+        center_t_xy = query_center[..., None, 0:2] - dist  # [B, Q, F, 2]
+        range_t = torch.norm(center_t_xy, dim=-1, keepdim=True)  # [B, Q, F, 1]
+        scale_ctx = self.build_scale_context(query_feat, time_diff_raw, range_t, size_log)
 
         dist = dist[:, :, :, None, None, :]  # [B, Q, F, 1, 1, 2]
         sampling_points = torch.cat([
@@ -335,15 +394,17 @@ class SparseBEVSampling(BaseModule):
         ], dim=-1)
 
         # scale weights
-        scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
-        # 查询驱动的时序尺度偏置：每个query为不同帧生成不同FPN层偏好
-        tsb = self.temporal_scale_bias(query_feat)                            # [B, Q, F*L]
-        tsb = tsb.view(B, Q, 1, self.num_frames, 1, self.num_levels)         # [B, Q, 1, F, 1, L]
-        scale_weights = scale_weights.expand(B, Q, self.num_groups, self.num_frames, self.num_points, self.num_levels)
-        scale_weights = torch.softmax(scale_weights + tsb, dim=-1)            # [B, Q, G, F, P, L]
+        # 直接用 query_feat + [|dt|, range_t, size] 生成完整的 [G, P, L] logits
+        scale_weights = self.scale_weights_head(scale_ctx)                    # [B, Q, F, G*P*L]
+        scale_weights = scale_weights.view(
+            B, Q, num_frames, self.num_groups, self.num_points, self.num_levels
+        )                                                                     # [B, Q, F, G, P, L]
+        scale_weights = scale_weights.permute(0, 1, 3, 2, 4, 5)              # [B, Q, G, F, P, L]
+        scale_weights = torch.softmax(scale_weights, dim=-1)                  # [B, Q, G, F, P, L]
 
         # sampling
-        sampled_feats, frame_validity = sampling_4d(
+        # 保持与初始 commit 一致：sampling_4d 仅返回采样特征
+        sampled_feats = sampling_4d(
             sampling_points,
             mlvl_feats,
             scale_weights,
@@ -351,19 +412,21 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        # 查询自适应时序权重：每个query根据自身特征决定各帧权重
-        query_temporal_w = self.temporal_refine(query_feat)                   # [B, Q, G*F]
-        query_temporal_w = query_temporal_w.view(B, Q, self.num_groups, self.num_frames)  # [B, Q, G, F]
-        temporal_weights = torch.softmax(query_temporal_w, dim=-1) * self.num_frames
+        # 真实时间感知的查询自适应时序权重
+        query_temporal_w = self.temporal_refine(temporal_ctx)                 # [B, Q, F, G]
+        query_temporal_w = query_temporal_w.permute(0, 1, 3, 2)              # [B, Q, G, F]
+        temporal_weights = torch.softmax(query_temporal_w, dim=-1) * num_frames
         # softmax 归一化 sum=1，乘 F 保持与原始等权融合一致的总幅值
 
         # 展开到 [B, Q, G, F*P, 1]：每帧P个点共享同一权重
-        temporal_weights = temporal_weights.unsqueeze(-1).expand(B, Q, self.num_groups, self.num_frames, self.num_points)
-        temporal_weights = temporal_weights.reshape(B, Q, self.num_groups, self.num_frames * self.num_points, 1)
+        temporal_weights = temporal_weights.unsqueeze(-1).expand(B, Q, self.num_groups, num_frames, self.num_points)
+        temporal_weights = temporal_weights.reshape(B, Q, self.num_groups, num_frames * self.num_points, 1)
         # 应用时序权重
         sampled_feats = sampled_feats * temporal_weights
 
-        return sampled_feats
+        point_offset = point_offset.permute(0, 1, 3, 2, 4, 5).reshape(B, Q, self.num_groups, num_frames * self.num_points, 3)
+
+        return sampled_feats, point_offset
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -402,11 +465,10 @@ class AdaptiveMixing(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
         # 运动感知的连续时序位置编码
-        # 输入: [t, vx·t, vy·t] (3维) —— 同时编码时间距离和运动位移
-        # 高速物体: vx·t 大 → 编码距离远 → point mixing 自然学会降权
-        # 静态物体: vx·t ≈ 0 → 编码仅由 t 决定 → 充分利用多帧
+        # 输入: [|t|, dx, dy, dz] (4维)
+        # 用时间距离和点偏移显式描述采样点之间的几何关系
         self.temporal_pos_encoder = nn.Sequential(
-            nn.Linear(3, 16),
+            nn.Linear(4, 16),
             nn.ReLU(inplace=True),
             nn.Linear(16, self.eff_in_dim),
         )
@@ -418,7 +480,7 @@ class AdaptiveMixing(nn.Module):
         nn.init.zeros_(self.temporal_pos_encoder[-1].weight)
         nn.init.zeros_(self.temporal_pos_encoder[-1].bias)
 
-    def inner_forward(self, x, query, time_diff=None, vel=None):
+    def inner_forward(self, x, query, time_diff=None, point_offset=None):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
@@ -426,29 +488,24 @@ class AdaptiveMixing(nn.Module):
 
         # 运动感知的连续时序位置编码
         if time_diff is not None:
-            # time_diff: [B, F] → 取batch均值 [F]
-            td = time_diff.mean(dim=0)                            # [F]
+            # 使用每个样本自己的真实时间间隔，而不是 batch 内均值
+            td_abs = time_diff.to(dtype=x.dtype).abs()             # [B, F]
+            assert td_abs.shape[1] == self.num_frames
+            td_exp = td_abs[:, None, None, :, None, None]         # [B, 1, 1, F, 1, 1]
 
-            if vel is not None:
-                # vel: [B, Q, 2], td: [F]
-                # 构造 per-query 的 [t, vx*t, vy*t]: [B, Q, F, 3]
-                td_exp = td[None, None, :]                        # [1, 1, F]
-                vx_t = vel[..., 0:1] * td_exp                    # [B, Q, F]
-                vy_t = vel[..., 1:2] * td_exp                    # [B, Q, F]
-                td_3d = torch.stack([
-                    td_exp.expand(B, Q, self.num_frames),         # [B, Q, F]
-                    vx_t,                                          # [B, Q, F]
-                    vy_t,                                          # [B, Q, F]
-                ], dim=-1)                                         # [B, Q, F, 3]
+            if point_offset is not None:
+                # point_offset: [B, Q, G, F*Ppf, 3]
+                td_per_point = td_exp.expand(B, Q, G, self.num_frames, self.points_per_frame, 1)
+                td_per_point = td_per_point.reshape(B, Q, G, P, 1)  # [B, Q, G, F*Ppf, 1]
+                pos_desc = torch.cat([td_per_point, point_offset.to(dtype=x.dtype)], dim=-1)  # [B, Q, G, P, 4]
             else:
-                td_3d = td[None, None, :, None].expand(B, Q, self.num_frames, 1)
-                td_3d = torch.cat([td_3d, torch.zeros(B, Q, self.num_frames, 2, device=x.device)], dim=-1)
+                td_per_point = td_exp.expand(B, Q, G, self.num_frames, self.points_per_frame, 1)
+                td_per_point = td_per_point.reshape(B, Q, G, P, 1)
+                zeros = torch.zeros(B, Q, G, P, 3, device=x.device, dtype=x.dtype)
+                pos_desc = torch.cat([td_per_point, zeros], dim=-1)
 
-            temp_pos = self.temporal_pos_encoder(td_3d)            # [B, Q, F, C_g]
-            # 每帧内P个点共享同一编码
-            temp_pos = temp_pos.unsqueeze(3).expand(B, Q, self.num_frames, self.points_per_frame, C)
-            temp_pos = temp_pos.reshape(B, Q, 1, P, C)            # [B, Q, 1, F*Pp, C_g]
-            x = x + temp_pos                                       # broadcast G维
+            temp_pos = self.temporal_pos_encoder(pos_desc)         # [B, Q, G, P, C_g]
+            x = x + temp_pos
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
@@ -476,8 +533,8 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def forward(self, x, query, time_diff=None, vel=None):
+    def forward(self, x, query, time_diff=None, point_offset=None):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, time_diff, vel, use_reentrant=False)
+            return cp(self.inner_forward, x, query, time_diff, point_offset, use_reentrant=False)
         else:
-            return self.inner_forward(x, query, time_diff, vel)
+            return self.inner_forward(x, query, time_diff, point_offset)
