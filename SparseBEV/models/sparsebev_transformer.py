@@ -349,19 +349,12 @@ class SparseBEVSampling(BaseModule):
             scale_weights,
             img_metas[0]['lidar2img'],
             image_h, image_w
-        )  # sampled_feats: [B, Q, G, FP, C], frame_validity: [B, Q, G, F]
+        )  # [B, Q, G, FP, C]
 
-        # [Round 4] 查询自适应时序权重：每个query根据自身特征决定各帧权重
+        # 查询自适应时序权重：每个query根据自身特征决定各帧权重
         query_temporal_w = self.temporal_refine(query_feat)                   # [B, Q, G*F]
         query_temporal_w = query_temporal_w.view(B, Q, self.num_groups, self.num_frames)  # [B, Q, G, F]
-
-        # [Round 7 + Round 12] 采样点有效性置信度加权
-        fv = frame_validity.detach().clone()                                 # [B, Q, G, F]
-        fv[:, :, :, 0] = fv[:, :, :, 0].clamp(min=0.1)
-
-        # 有效性作为 mask 乘到 logits 上（无效帧→大负值→softmax后≈0）
-        validity_mask = torch.log(fv + 1e-6)                                # [B, Q, G, F]
-        temporal_weights = torch.softmax(query_temporal_w + validity_mask, dim=-1) * self.num_frames
+        temporal_weights = torch.softmax(query_temporal_w, dim=-1) * self.num_frames
         # softmax 归一化 sum=1，乘 F 保持与原始等权融合一致的总幅值
 
         # 展开到 [B, Q, G, F*P, 1]：每帧P个点共享同一权重

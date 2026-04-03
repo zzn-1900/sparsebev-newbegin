@@ -127,11 +127,4 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, im
     final = final.permute(0, 3, 2, 1, 5, 4)
     final = final.flatten(3, 4)  # [B, Q, G, FP, C]
 
-    # [Round 7] 计算每帧的采样点有效率，传回供时序权重使用
-    # valid_mask: [B, T, Q, GP, 1] (argmax后的单视角有效标志)
-    valid_mask = valid_mask.squeeze(-1)  # [B, T, Q, GP]
-    valid_mask = valid_mask.reshape(B, T, Q, G, P)
-    valid_mask = valid_mask.permute(0, 2, 3, 1, 4)  # [B, Q, G, T, P]
-    frame_validity = valid_mask.mean(dim=-1)  # [B, Q, G, T] 每帧平均有效率
-
-    return final, frame_validity
+    return final
