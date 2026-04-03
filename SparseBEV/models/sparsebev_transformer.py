@@ -167,11 +167,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat, point_offset = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-
-        # 将采样点偏移和时间差传给 mixing，用于点级别的时序几何位置编码
-        time_diff = img_metas[0]['time_diff']       # [B, F]     秒
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, time_diff, point_offset))
+        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
 
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -262,7 +259,8 @@ class SparseBEVSampling(BaseModule):
         self.num_groups = num_groups
         self.num_levels = num_levels
         self.pc_range = pc_range
-        self.temporal_context_dim = 16
+        self.temporal_context_dim = 32
+        self.context_dropout = 0.1
 
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
 
@@ -273,6 +271,7 @@ class SparseBEVSampling(BaseModule):
         self.temporal_motion_encoder = nn.Sequential(
             nn.Linear(2, self.temporal_context_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(self.context_dropout),
             nn.Linear(self.temporal_context_dim, self.temporal_context_dim),
         )
         self.temporal_act = nn.ReLU(inplace=True)
@@ -282,6 +281,7 @@ class SparseBEVSampling(BaseModule):
         self.scale_motion_encoder = nn.Sequential(
             nn.Linear(5, self.temporal_context_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(self.context_dropout),
             nn.Linear(self.temporal_context_dim, self.temporal_context_dim),
         )
         self.scale_act = nn.ReLU(inplace=True)
@@ -369,11 +369,8 @@ class SparseBEVSampling(BaseModule):
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
         sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
         query_center = decode_bbox(query_bbox, self.pc_range)[..., 0:3]  # [B, Q, 3]
-        point_offset = sampling_points - query_center[:, :, None, :]  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
-        point_offset = point_offset.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
-        point_offset = point_offset.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
         # warp sample points based on velocity
         time_diff = time_diff_raw  # [B, F]
@@ -424,9 +421,7 @@ class SparseBEVSampling(BaseModule):
         # 应用时序权重
         sampled_feats = sampled_feats * temporal_weights
 
-        point_offset = point_offset.permute(0, 1, 3, 2, 4, 5).reshape(B, Q, self.num_groups, num_frames * self.num_points, 3)
-
-        return sampled_feats, point_offset
+        return sampled_feats
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -464,48 +459,15 @@ class AdaptiveMixing(nn.Module):
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
-        # 运动感知的连续时序位置编码
-        # 输入: [|t|, dx, dy, dz] (4维)
-        # 用时间距离和点偏移显式描述采样点之间的几何关系
-        self.temporal_pos_encoder = nn.Sequential(
-            nn.Linear(4, 16),
-            nn.ReLU(inplace=True),
-            nn.Linear(16, self.eff_in_dim),
-        )
-
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
-        # [Round 6] 时序位置编码器零初始化，初始时不影响原始特征
-        nn.init.zeros_(self.temporal_pos_encoder[-1].weight)
-        nn.init.zeros_(self.temporal_pos_encoder[-1].bias)
 
-    def inner_forward(self, x, query, time_diff=None, point_offset=None):
+    def inner_forward(self, x, query):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
-
-        # 运动感知的连续时序位置编码
-        if time_diff is not None:
-            # 使用每个样本自己的真实时间间隔，而不是 batch 内均值
-            td_abs = time_diff.to(dtype=x.dtype).abs()             # [B, F]
-            assert td_abs.shape[1] == self.num_frames
-            td_exp = td_abs[:, None, None, :, None, None]         # [B, 1, 1, F, 1, 1]
-
-            if point_offset is not None:
-                # point_offset: [B, Q, G, F*Ppf, 3]
-                td_per_point = td_exp.expand(B, Q, G, self.num_frames, self.points_per_frame, 1)
-                td_per_point = td_per_point.reshape(B, Q, G, P, 1)  # [B, Q, G, F*Ppf, 1]
-                pos_desc = torch.cat([td_per_point, point_offset.to(dtype=x.dtype)], dim=-1)  # [B, Q, G, P, 4]
-            else:
-                td_per_point = td_exp.expand(B, Q, G, self.num_frames, self.points_per_frame, 1)
-                td_per_point = td_per_point.reshape(B, Q, G, P, 1)
-                zeros = torch.zeros(B, Q, G, P, 3, device=x.device, dtype=x.dtype)
-                pos_desc = torch.cat([td_per_point, zeros], dim=-1)
-
-            temp_pos = self.temporal_pos_encoder(pos_desc)         # [B, Q, G, P, C_g]
-            x = x + temp_pos
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
@@ -533,8 +495,8 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def forward(self, x, query, time_diff=None, point_offset=None):
+    def forward(self, x, query):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, time_diff, point_offset, use_reentrant=False)
+            return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
-            return self.inner_forward(x, query, time_diff, point_offset)
+            return self.inner_forward(x, query)
