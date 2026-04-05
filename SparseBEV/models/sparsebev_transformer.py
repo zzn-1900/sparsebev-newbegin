@@ -327,7 +327,7 @@ class AdaptiveMixing(nn.Module):
     """Adaptive Mixing"""
     def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
                  uncertainty_hidden_dim=16, uncertainty_branch_dim=32, uncertainty_dropout=0.1,
-                 confidence_floor=0.05, num_frames=1):
+                 confidence_floor=0.05, num_frames=1, debug_print_prob=0.00033):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -343,6 +343,7 @@ class AdaptiveMixing(nn.Module):
         self.confidence_floor = confidence_floor
         self.num_frames = num_frames
         self.uncertainty_branch_dim = uncertainty_branch_dim
+        self.debug_print_prob = debug_print_prob
         assert self.in_points % self.num_frames == 0
         self.points_per_frame = self.in_points // self.num_frames
 
@@ -422,6 +423,34 @@ class AdaptiveMixing(nn.Module):
 
         return x_frames, frame_confidence, frame_uncertainty
 
+    @torch.no_grad()
+    def maybe_print_temporal_gate(self, x, query):
+        if self.debug_print_prob <= 0:
+            return
+
+        prob = torch.rand((), device=x.device).item()
+        if prob >= self.debug_print_prob:
+            return
+
+        _, frame_confidence, frame_uncertainty = self.temporal_gate(x.detach(), query.detach())
+        batch_id = torch.randint(frame_confidence.shape[0], (1,), device=x.device).item()
+        query_id = torch.randint(frame_confidence.shape[1], (1,), device=x.device).item()
+
+        gate = frame_confidence[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
+        uncertainty = frame_uncertainty[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
+        gate = torch.round(gate * 1000) / 1000
+        uncertainty = torch.round(uncertainty * 1000) / 1000
+
+        print(
+            '[TemporalGate] stage={} batch={} query={} confidence[T,G]={} uncertainty[T,G]={}'.format(
+                DUMP.stage_count,
+                batch_id,
+                query_id,
+                gate.tolist(),
+                uncertainty.tolist(),
+            )
+        )
+
     def inner_forward(self, x, query):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
@@ -462,6 +491,7 @@ class AdaptiveMixing(nn.Module):
         return out
 
     def forward(self, x, query):
+        self.maybe_print_temporal_gate(x, query)
         if self.training and x.requires_grad:
             return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
