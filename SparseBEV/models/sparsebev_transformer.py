@@ -121,7 +121,13 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(
+            in_dim=embed_dims,
+            in_points=num_points * num_frames,
+            n_groups=4,
+            out_points=128,
+            num_frames=num_frames,
+        )
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -319,7 +325,9 @@ class SparseBEVSampling(BaseModule):
 
 class AdaptiveMixing(nn.Module):
     """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
+                 uncertainty_hidden_dim=16, uncertainty_branch_dim=32, uncertainty_dropout=0.1,
+                 confidence_floor=0.05, num_frames=1):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -332,6 +340,11 @@ class AdaptiveMixing(nn.Module):
         self.n_groups = n_groups
         self.out_dim = out_dim
         self.out_points = out_points
+        self.confidence_floor = confidence_floor
+        self.num_frames = num_frames
+        self.uncertainty_branch_dim = uncertainty_branch_dim
+        assert self.in_points % self.num_frames == 0
+        self.points_per_frame = self.in_points // self.num_frames
 
         self.eff_in_dim = in_dim // n_groups
         self.eff_out_dim = out_dim // n_groups
@@ -339,20 +352,88 @@ class AdaptiveMixing(nn.Module):
         self.m_parameters = self.eff_in_dim * self.eff_out_dim
         self.s_parameters = self.in_points * self.out_points
         self.total_parameters = self.m_parameters + self.s_parameters
+        self.quality_dim = self.uncertainty_branch_dim * 3
 
         self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.total_parameters)
+        self.history_proj = nn.Linear(self.eff_in_dim, self.uncertainty_branch_dim)
+        self.current_proj = nn.Linear(self.eff_in_dim, self.uncertainty_branch_dim)
+        self.query_context = nn.Linear(self.query_dim, self.n_groups * self.uncertainty_branch_dim)
+        self.type_embedding = nn.Embedding(3, self.uncertainty_branch_dim)
+        self.temporal_uncertainty = nn.Sequential(
+            nn.Linear(self.quality_dim, uncertainty_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=uncertainty_dropout),
+            nn.Linear(uncertainty_hidden_dim, 1),
+        )
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
+        nn.init.xavier_uniform_(self.history_proj.weight)
+        nn.init.zeros_(self.history_proj.bias)
+        nn.init.xavier_uniform_(self.current_proj.weight)
+        nn.init.zeros_(self.current_proj.bias)
+        nn.init.xavier_uniform_(self.query_context.weight)
+        nn.init.zeros_(self.query_context.bias)
+        nn.init.zeros_(self.type_embedding.weight)
+        nn.init.xavier_uniform_(self.temporal_uncertainty[0].weight)
+        nn.init.zeros_(self.temporal_uncertainty[0].bias)
+        nn.init.normal_(self.temporal_uncertainty[-1].weight, mean=0.0, std=1e-3)
+        nn.init.constant_(self.temporal_uncertainty[-1].bias, -4.0)
+
+    def temporal_gate(self, x, query):
+        B, Q, G, _, C = x.shape
+        x_frames = x.reshape(B, Q, G, self.num_frames, self.points_per_frame, C)
+        point_mask = (x_frames.abs().amax(dim=-1, keepdim=True) > 0).float()  # [B, Q, G, T, P, 1]
+        valid_count = point_mask.sum(dim=4).clamp(min=1.0)  # [B, Q, G, T, 1]
+
+        frame_feat = (x_frames * point_mask).sum(dim=4) / valid_count  # [B, Q, G, T, C]
+        current_feat = frame_feat[:, :, :, :1, :]  # current frame reference
+
+        if self.num_frames == 1:
+            frame_confidence = x.new_ones(B, Q, G, 1, 1)
+            frame_uncertainty = x.new_zeros(B, Q, G, 1, 1)
+            return x_frames, frame_confidence, frame_uncertainty
+
+        history_feat = frame_feat[:, :, :, 1:, :]
+        current_feat = self.current_proj(current_feat) + self.type_embedding.weight[1]
+        current_feat = current_feat.expand(B, Q, G, self.num_frames - 1, self.uncertainty_branch_dim)
+        query_context = self.query_context(query).reshape(B, Q, G, 1, self.uncertainty_branch_dim)
+        query_context = query_context.expand(B, Q, G, self.num_frames - 1, self.uncertainty_branch_dim)
+
+        history_feat = self.history_proj(history_feat) + self.type_embedding.weight[0]
+        query_context = query_context + self.type_embedding.weight[2]
+
+        quality = torch.cat([
+            history_feat,
+            current_feat,
+            query_context,
+        ], dim=-1)
+        history_uncertainty = self.temporal_uncertainty(quality.reshape(-1, self.quality_dim))
+        history_uncertainty = F.softplus(history_uncertainty)
+        history_uncertainty = history_uncertainty.reshape(B, Q, G, self.num_frames - 1, 1)
+
+        history_confidence = torch.clamp(torch.exp(-history_uncertainty), min=self.confidence_floor)
+        current_confidence = x.new_ones(B, Q, G, 1, 1)
+        frame_confidence = torch.cat([current_confidence, history_confidence], dim=3)
+        frame_uncertainty = torch.cat([x.new_zeros(B, Q, G, 1, 1), history_uncertainty], dim=3)
+
+        return x_frames, frame_confidence, frame_uncertainty
 
     def inner_forward(self, x, query):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
+
+        x_frames, frame_confidence, frame_uncertainty = self.temporal_gate(x, query)
+        x = (x_frames * frame_confidence.unsqueeze(4)).reshape(B, Q, G, P, C)
+
+        if DUMP.enabled:
+            torch.save(frame_confidence.cpu(), '{}/temporal_group_confidence_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
+            torch.save(frame_uncertainty.cpu(), '{}/temporal_group_uncertainty_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)

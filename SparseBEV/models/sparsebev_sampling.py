@@ -101,9 +101,8 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, im
     # we only keep at most one valid sampling point, see https://zhuanlan.zhihu.com/p/654821380
     i_view = torch.argmax(valid_mask, dim=-1)[..., None]  # [B, T, Q, GP, 1]
 
-    # index the only one sampling point and its valid flag
-    sample_points_cam = sample_points_cam[i_batch, i_time, i_query, i_point, i_view, :]  # [B, Q, GP, 1, 2]
-    valid_mask = valid_mask[i_batch, i_time, i_query, i_point, i_view]  # [B, Q, GP, 1]
+    # index the only one sampling point
+    sample_points_cam = sample_points_cam[i_batch, i_time, i_query, i_point, i_view, :]  # [B, T, Q, GP, 1, 2]
 
     # treat the view index as a new axis for grid_sample and normalize the view index to [0, 1]
     sample_points_cam = torch.cat([sample_points_cam, i_view[..., None].float() / (N - 1)], dim=-1)
