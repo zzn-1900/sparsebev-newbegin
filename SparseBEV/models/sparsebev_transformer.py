@@ -438,16 +438,28 @@ class AdaptiveMixing(nn.Module):
 
         gate = frame_confidence[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
         uncertainty = frame_uncertainty[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
-        gate = torch.round(gate * 1000) / 1000
-        uncertainty = torch.round(uncertainty * 1000) / 1000
+        gate_str = np.array2string(
+            gate.numpy(),
+            precision=3,
+            separator=', ',
+            suppress_small=False,
+            floatmode='fixed',
+        )
+        uncertainty_str = np.array2string(
+            uncertainty.numpy(),
+            precision=3,
+            separator=', ',
+            suppress_small=False,
+            floatmode='fixed',
+        )
 
         print(
             '[TemporalGate] stage={} batch={} query={} confidence[T,G]={} uncertainty[T,G]={}'.format(
                 DUMP.stage_count,
                 batch_id,
                 query_id,
-                gate.tolist(),
-                uncertainty.tolist(),
+                gate_str,
+                uncertainty_str,
             )
         )
 
