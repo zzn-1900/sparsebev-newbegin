@@ -433,22 +433,13 @@ class AdaptiveMixing(nn.Module):
             return
 
         _, frame_confidence, frame_uncertainty = self.temporal_gate(x.detach(), query.detach())
-        frame_weight = frame_confidence / frame_confidence.sum(dim=3, keepdim=True).clamp(min=1e-6)
         batch_id = torch.randint(frame_confidence.shape[0], (1,), device=x.device).item()
         query_id = torch.randint(frame_confidence.shape[1], (1,), device=x.device).item()
 
         gate = frame_confidence[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
-        weight = frame_weight[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
         uncertainty = frame_uncertainty[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
         gate_str = np.array2string(
             gate.numpy(),
-            precision=3,
-            separator=', ',
-            suppress_small=False,
-            floatmode='fixed',
-        )
-        weight_str = np.array2string(
-            weight.numpy(),
             precision=3,
             separator=', ',
             suppress_small=False,
@@ -463,12 +454,11 @@ class AdaptiveMixing(nn.Module):
         )
 
         print(
-            '[TemporalGate] stage={} batch={} query={} confidence[T,G]={} weight[T,G]={} uncertainty[T,G]={}'.format(
+            '[TemporalGate] stage={} batch={} query={} confidence[T,G]={} uncertainty[T,G]={}'.format(
                 DUMP.stage_count,
                 batch_id,
                 query_id,
                 gate_str,
-                weight_str,
                 uncertainty_str,
             )
         )
@@ -484,7 +474,6 @@ class AdaptiveMixing(nn.Module):
 
         if DUMP.enabled:
             torch.save(frame_confidence.cpu(), '{}/temporal_group_confidence_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
-            torch.save(frame_weight.cpu(), '{}/temporal_group_weight_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
             torch.save(frame_uncertainty.cpu(), '{}/temporal_group_uncertainty_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
 
         '''generate mixing parameters'''
