@@ -503,9 +503,8 @@ class AdaptiveMixing(nn.Module):
         out = self.act(out)
 
         '''adaptive point mixing'''
-        S = S.unsqueeze(2) * frame_weight
-        out = torch.matmul(S, out)  # [BQ, G, T, out_points, C]
-        out = out.sum(dim=2)
+        out = (out * frame_weight).sum(dim=2)
+        out = torch.matmul(S, out)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
