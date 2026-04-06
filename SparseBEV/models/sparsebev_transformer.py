@@ -351,7 +351,7 @@ class AdaptiveMixing(nn.Module):
         self.eff_out_dim = out_dim // n_groups
 
         self.m_parameters = self.eff_in_dim * self.eff_out_dim
-        self.s_parameters = self.in_points * self.out_points
+        self.s_parameters = self.points_per_frame * self.out_points
         self.total_parameters = self.m_parameters + self.s_parameters
         self.quality_dim = self.uncertainty_branch_dim * 3
 
@@ -433,13 +433,22 @@ class AdaptiveMixing(nn.Module):
             return
 
         _, frame_confidence, frame_uncertainty = self.temporal_gate(x.detach(), query.detach())
+        frame_weight = frame_confidence / frame_confidence.sum(dim=3, keepdim=True).clamp(min=1e-6)
         batch_id = torch.randint(frame_confidence.shape[0], (1,), device=x.device).item()
         query_id = torch.randint(frame_confidence.shape[1], (1,), device=x.device).item()
 
         gate = frame_confidence[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
+        weight = frame_weight[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
         uncertainty = frame_uncertainty[batch_id, query_id, :, :, 0].transpose(0, 1).detach().cpu()
         gate_str = np.array2string(
             gate.numpy(),
+            precision=3,
+            separator=', ',
+            suppress_small=False,
+            floatmode='fixed',
+        )
+        weight_str = np.array2string(
+            weight.numpy(),
             precision=3,
             separator=', ',
             suppress_small=False,
@@ -454,11 +463,12 @@ class AdaptiveMixing(nn.Module):
         )
 
         print(
-            '[TemporalGate] stage={} batch={} query={} confidence[T,G]={} uncertainty[T,G]={}'.format(
+            '[TemporalGate] stage={} batch={} query={} confidence[T,G]={} weight[T,G]={} uncertainty[T,G]={}'.format(
                 DUMP.stage_count,
                 batch_id,
                 query_id,
                 gate_str,
+                weight_str,
                 uncertainty_str,
             )
         )
@@ -470,28 +480,32 @@ class AdaptiveMixing(nn.Module):
         assert C == self.eff_in_dim
 
         x_frames, frame_confidence, frame_uncertainty = self.temporal_gate(x, query)
-        x = (x_frames * frame_confidence.unsqueeze(4)).reshape(B, Q, G, P, C)
+        frame_weight = frame_confidence / frame_confidence.sum(dim=3, keepdim=True).clamp(min=1e-6)
 
         if DUMP.enabled:
             torch.save(frame_confidence.cpu(), '{}/temporal_group_confidence_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
+            torch.save(frame_weight.cpu(), '{}/temporal_group_weight_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
             torch.save(frame_uncertainty.cpu(), '{}/temporal_group_uncertainty_stage{}.pth'.format(DUMP.out_dir, DUMP.stage_count))
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
         params = params.reshape(B*Q, G, -1)
-        out = x.reshape(B*Q, G, P, C)
+        out = x_frames.reshape(B*Q, G, self.num_frames, self.points_per_frame, C)
+        frame_weight = frame_weight.reshape(B*Q, G, self.num_frames, 1, 1)
 
         M, S = params.split([self.m_parameters, self.s_parameters], 2)
         M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
-        S = S.reshape(B*Q, G, self.out_points, self.in_points)
+        S = S.reshape(B*Q, G, self.out_points, self.points_per_frame)
 
         '''adaptive channel mixing'''
-        out = torch.matmul(out, M)
+        out = torch.matmul(out, M.unsqueeze(2))
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
         '''adaptive point mixing'''
-        out = torch.matmul(S, out)  # implicitly transpose and matmul
+        S = S.unsqueeze(2) * frame_weight
+        out = torch.matmul(S, out)  # [BQ, G, T, out_points, C]
+        out = out.sum(dim=2)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
