@@ -490,7 +490,7 @@ class AdaptiveMixing(nn.Module):
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
         params = params.reshape(B*Q, G, -1)
-        out = x_frames.reshape(B*Q, G, self.num_frames, self.points_per_frame, C)
+        out = x.reshape(B*Q, G, P, C)
         frame_weight = frame_weight.reshape(B*Q, G, self.num_frames, 1, 1)
 
         M, S = params.split([self.m_parameters, self.s_parameters], 2)
@@ -498,11 +498,12 @@ class AdaptiveMixing(nn.Module):
         S = S.reshape(B*Q, G, self.out_points, self.points_per_frame)
 
         '''adaptive channel mixing'''
-        out = torch.matmul(out, M.unsqueeze(2))
+        out = torch.matmul(out, M)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
         '''adaptive point mixing'''
+        out = out.reshape(B*Q, G, self.num_frames, self.points_per_frame, self.eff_out_dim)
         out = (out * frame_weight).sum(dim=2)
         out = torch.matmul(S, out)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
