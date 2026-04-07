@@ -121,7 +121,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -167,8 +167,12 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
+        sampled_feat, sampled_offset, sampled_time, sampled_mask = self.sampling(
+            query_bbox, query_feat, mlvl_feats, img_metas
+        )
+        query_feat = self.norm2(
+            self.mixing(sampled_feat, query_feat, sampled_offset, sampled_time, sampled_mask)
+        )
         query_feat = self.norm3(self.ffn(query_feat))
 
         cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
@@ -282,6 +286,12 @@ class SparseBEVSampling(BaseModule):
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
+        sampling_offset = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
+        local_offset = sampling_offset[:, :, :, None, :, :].expand(
+            B, Q, self.num_groups, self.num_frames, self.num_points, 3
+        )
+        local_offset = local_offset.flatten(3, 4)  # [B, Q, G, FP, 3]
+
         # warp sample points based on velocity
         time_diff = img_metas[0]['time_diff']  # [B, F]
         time_diff = time_diff[:, None, :, None]  # [B, 1, F, 1]
@@ -300,7 +310,7 @@ class SparseBEVSampling(BaseModule):
         scale_weights = scale_weights.expand(B, Q, self.num_groups, self.num_frames, self.num_points, self.num_levels)
 
         # sampling
-        sampled_feats = sampling_4d(
+        sampled_feats, valid_mask = sampling_4d(
             sampling_points,
             mlvl_feats,
             scale_weights,
@@ -308,7 +318,11 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        return sampled_feats
+        token_time = img_metas[0]['time_diff'][:, None, None, :, None, None]
+        token_time = token_time.expand(B, Q, self.num_groups, self.num_frames, self.num_points, 1)
+        token_time = token_time.flatten(3, 4)  # [B, Q, G, FP, 1]
+
+        return sampled_feats, local_offset, token_time, valid_mask
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -318,12 +332,11 @@ class SparseBEVSampling(BaseModule):
 
 
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing"""
+    """Dynamic channel mixing with query-to-token cross attention."""
     def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
-        out_points = out_points if out_points is not None else in_points
         query_dim = query_dim if query_dim is not None else in_dim
 
         self.query_dim = query_dim
@@ -331,57 +344,99 @@ class AdaptiveMixing(nn.Module):
         self.in_points = in_points
         self.n_groups = n_groups
         self.out_dim = out_dim
-        self.out_points = out_points
 
         self.eff_in_dim = in_dim // n_groups
         self.eff_out_dim = out_dim // n_groups
 
         self.m_parameters = self.eff_in_dim * self.eff_out_dim
-        self.s_parameters = self.in_points * self.out_points
-        self.total_parameters = self.m_parameters + self.s_parameters
 
-        self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.total_parameters)
-        self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
+        self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.m_parameters)
+        self.geo_pos_encoder = nn.Sequential(
+            nn.Linear(3, self.eff_out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.eff_out_dim, self.eff_out_dim),
+        )
+        self.time_pos_encoder = nn.Sequential(
+            nn.Linear(1, self.eff_out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.eff_out_dim, self.eff_out_dim),
+        )
+        self.q_proj = nn.Linear(self.query_dim, self.n_groups * self.eff_out_dim)
+        self.k_proj = nn.Linear(self.eff_out_dim, self.eff_out_dim)
+        self.v_proj = nn.Linear(self.eff_out_dim, self.eff_out_dim)
+        self.out_proj = nn.Linear(self.eff_out_dim * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
+        self.scale = self.eff_out_dim ** -0.5
 
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
+        identity = torch.eye(self.eff_in_dim, self.eff_out_dim, device=self.parameter_generator.bias.device)
+        identity = identity.reshape(1, -1).repeat(self.n_groups, 1).reshape(-1)
+        self.parameter_generator.bias.copy_(identity)
+        nn.init.zeros_(self.geo_pos_encoder[-1].weight)
+        nn.init.zeros_(self.geo_pos_encoder[-1].bias)
+        nn.init.zeros_(self.time_pos_encoder[-1].weight)
+        nn.init.zeros_(self.time_pos_encoder[-1].bias)
+        nn.init.zeros_(self.out_proj.bias)
 
-    def inner_forward(self, x, query):
+    def inner_forward(self, x, query, offset, time, valid_mask):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
 
-        '''generate mixing parameters'''
+        # Dynamic channel mixing keeps the original content-adaptive channel fusion.
         params = self.parameter_generator(query)
-        params = params.reshape(B*Q, G, -1)
+        params = params.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
         out = x.reshape(B*Q, G, P, C)
-
-        M, S = params.split([self.m_parameters, self.s_parameters], 2)
-        M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
-        S = S.reshape(B*Q, G, self.out_points, self.in_points)
-
-        '''adaptive channel mixing'''
-        out = torch.matmul(out, M)
+        out = torch.matmul(out, params)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''adaptive point mixing'''
-        out = torch.matmul(S, out)  # implicitly transpose and matmul
-        out = F.layer_norm(out, [out.size(-2), out.size(-1)])
-        out = self.act(out)
+        # Add geometry and time encodings before reading tokens with attention.
+        geo = self.geo_pos_encoder(offset.reshape(B*Q, G, P, 3))
+        time = self.time_pos_encoder(time.reshape(B*Q, G, P, 1))
+        tokens = out + geo + time
 
-        '''linear transfomation to query dim'''
+        q = self.q_proj(query).reshape(B*Q, G, 1, self.eff_out_dim)
+        k = self.k_proj(tokens)
+        v = self.v_proj(tokens)
+
+        mask = valid_mask.reshape(B*Q, G, P, 1).bool()
+        tokens = tokens.masked_fill(~mask, 0.0)
+        k = k.masked_fill(~mask, 0.0)
+        v = v.masked_fill(~mask, 0.0)
+
+        out = self.cross_attn(q, k, v, mask).squeeze(-2)  # [BQ, G, C]
         out = out.reshape(B, Q, -1)
         out = self.out_proj(out)
         out = query + out
 
         return out
 
-    def forward(self, x, query):
-        if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, use_reentrant=False)
+    def cross_attn(self, q, k, v, mask):
+        attn_mask = mask.squeeze(-1).unsqueeze(-2)  # [BQ, G, 1, P]
+        has_valid = attn_mask.any(dim=-1, keepdim=True)
+        attn_mask = attn_mask.clone()
+        attn_mask[..., :1] |= ~has_valid
+
+        if hasattr(F, 'scaled_dot_product_attention'):
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+            )
         else:
-            return self.inner_forward(x, query)
+            attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+            attn = attn.masked_fill(~attn_mask, -1e4)
+            attn = torch.softmax(attn, dim=-1)
+            out = torch.matmul(attn, v)
+
+        return out * has_valid.to(out.dtype)
+
+    def forward(self, x, query, offset, time, valid_mask):
+        if self.training and x.requires_grad:
+            return cp(self.inner_forward, x, query, offset, time, valid_mask, use_reentrant=False)
+        else:
+            return self.inner_forward(x, query, offset, time, valid_mask)
