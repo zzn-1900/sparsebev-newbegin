@@ -30,14 +30,15 @@ num_points = 4
 
 proto_query_cfg = dict(
     enabled=True,
+    num_prototypes=8,
+    memory_size_per_class=100,
     bank_momentum=0.99,
-    min_proto_count=32,
-    use_layers=[4, 5],
+    min_memory_count=8,
+    refine_layers=[0, 1, 2, 3, 4],
     lambda_proto=0.1,
-    temperature=0.07,
-    difficulty_hidden_dim=64,
-    proto_hidden_dim=256,
-    prototype_refine=True,
+    prototype_cross_attn=True,
+    prototype_topk_classes=2,
+    prototype_attn_heads=8,
 )
 
 img_backbone = dict(

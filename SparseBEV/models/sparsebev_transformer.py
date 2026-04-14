@@ -8,7 +8,7 @@ from mmcv.cnn.bricks.transformer import MultiheadAttention, FFN
 from mmdet.models.utils.builder import TRANSFORMER
 from .bbox.utils import decode_bbox
 from .utils import inverse_sigmoid, DUMP
-from .proto_query import QueryDifficultyEstimator, PrototypeRefiner, mix_query_prototypes
+from .proto_query import PrototypeCrossAttention
 from .sparsebev_sampling import sampling_4d, make_sample_points
 from .checkpoint import checkpoint as cp
 from .csrc.wrapper import MSMV_CUDA
@@ -49,8 +49,9 @@ class SparseBEVTransformer(BaseModule):
                 prototype_bank=None,
                 prototype_count=None,
                 prototype_min_count=0,
-                dn_pad_size=0):
-        cls_scores, bbox_preds, query_feats = self.decoder(
+                dn_pad_size=0,
+                return_query_feats=False):
+        cls_scores, bbox_preds, final_query_feats = self.decoder(
             query_bbox,
             query_feat,
             mlvl_feats,
@@ -60,13 +61,15 @@ class SparseBEVTransformer(BaseModule):
             prototype_count=prototype_count,
             prototype_min_count=prototype_min_count,
             dn_pad_size=dn_pad_size,
+            return_query_feats=return_query_feats,
         )
 
         cls_scores = torch.nan_to_num(cls_scores)
         bbox_preds = torch.nan_to_num(bbox_preds)
-        query_feats = torch.nan_to_num(query_feats)
+        if final_query_feats is not None:
+            final_query_feats = torch.nan_to_num(final_query_feats)
 
-        return cls_scores, bbox_preds, query_feats
+        return cls_scores, bbox_preds, final_query_feats
 
 
 class SparseBEVTransformerDecoder(BaseModule):
@@ -82,43 +85,57 @@ class SparseBEVTransformerDecoder(BaseModule):
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
             embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
         )
-        self.difficulty_estimator = None
-        self.prototype_refiner = None
+        self.prototype_cross_attention = None
         self.configure_proto_query(proto_query)
 
     def configure_proto_query(self, proto_query):
         self.proto_query = {} if proto_query is None else dict(proto_query)
         self.proto_enabled = bool(self.proto_query.get('enabled', False))
-        use_layers = self.proto_query.get('use_layers')
-        if use_layers is None:
-            use_layers = list(range(max(0, self.num_layers - 2), self.num_layers))
-        self.proto_use_layers = tuple(sorted(set(use_layers)))
-        self.prototype_refine_enabled = bool(self.proto_query.get('prototype_refine', False)) and self.proto_enabled
+        refine_layers = self.proto_query.get('refine_layers')
+        if refine_layers is None:
+            refine_layers = self.proto_query.get('use_layers')
+        if refine_layers is None:
+            refine_layers = [max(0, self.num_layers - 2)]
+
+        self.proto_refine_layers = tuple(sorted({
+            int(layer_idx)
+            for layer_idx in refine_layers
+            if 0 <= int(layer_idx) < self.num_layers - 1
+        }))
+        self.prototype_refine_enabled = (
+            bool(self.proto_query.get(
+                'prototype_cross_attn',
+                self.proto_query.get('prototype_refine', False),
+            ))
+            and self.proto_enabled
+            and len(self.proto_refine_layers) > 0
+        )
 
         if self.proto_enabled:
-            difficulty_hidden_dim = self.proto_query.get('difficulty_hidden_dim', 64)
-            proto_hidden_dim = self.proto_query.get('proto_hidden_dim', 256)
-
-            self.difficulty_estimator = QueryDifficultyEstimator(
-                num_classes=self.num_classes,
-                code_size=self.code_size,
-                hidden_dim=difficulty_hidden_dim,
-            )
-            self.prototype_refiner = PrototypeRefiner(
+            self.prototype_cross_attention = PrototypeCrossAttention(
                 embed_dims=self.embed_dims,
-                hidden_dim=proto_hidden_dim,
+                num_classes=self.num_classes,
+                num_prototypes=int(self.proto_query.get('num_prototypes', 8)),
+                topk_classes=int(self.proto_query.get('prototype_topk_classes', 2)),
+                num_heads=int(self.proto_query.get('prototype_attn_heads', 8)),
+                attn_drop=float(self.proto_query.get('prototype_attn_drop', 0.1)),
+                ffn_hidden_dim=int(self.proto_query.get('prototype_ffn_hidden_dim', 512)),
+                max_memory_tokens=int(self.proto_query.get(
+                    'prototype_topk_slots',
+                    self.proto_query.get(
+                        'prototype_topk_classes',
+                        2,
+                    ) * self.proto_query.get('num_prototypes', 8),
+                )),
             )
         else:
-            self.difficulty_estimator = None
-            self.prototype_refiner = None
+            self.prototype_cross_attention = None
 
     @torch.no_grad()
     def init_weights(self):
         self.decoder_layer.init_weights()
-        if self.difficulty_estimator is not None:
-            self.difficulty_estimator.init_weights()
-        if self.prototype_refiner is not None:
-            self.prototype_refiner.init_weights()
+        if self.prototype_cross_attention is not None:
+            self.prototype_cross_attention.init_weights()
 
     def forward(self,
                 query_bbox,
@@ -129,10 +146,10 @@ class SparseBEVTransformerDecoder(BaseModule):
                 prototype_bank=None,
                 prototype_count=None,
                 prototype_min_count=0,
-                dn_pad_size=0):
-        cls_scores, bbox_preds, query_feats = [], [], []
-        prev_match_query_feat = None
-        prev_match_bbox_pred = None
+                dn_pad_size=0,
+                return_query_feats=False):
+        cls_scores, bbox_preds = [], []
+        final_query_feats = None
 
         # calculate time difference according to timestamps
         timestamps = np.array([m['img_timestamp'] for m in img_metas], dtype=np.float64)
@@ -168,34 +185,20 @@ class SparseBEVTransformerDecoder(BaseModule):
             layer_query_feat, cls_score, bbox_pred = self.decoder_layer(
                 query_bbox, query_feat, mlvl_feats, attn_mask, img_metas
             )
-            query_feats.append(layer_query_feat)
+            if return_query_feats:
+                final_query_feats = layer_query_feat
 
-            if self.prototype_refine_enabled and i in self.proto_use_layers and i < self.num_layers - 1:
+            if self.prototype_refine_enabled and i in self.proto_refine_layers:
                 match_query_feat = layer_query_feat[:, dn_pad_size:]
                 match_cls_score = cls_score[:, dn_pad_size:]
-                match_bbox_pred = bbox_pred[:, dn_pad_size:]
 
                 if match_query_feat.shape[1] > 0:
-                    diff_score = self.difficulty_estimator(
+                    refined_match_query_feat = self.prototype_cross_attention(
                         match_query_feat,
-                        prev_match_query_feat,
-                        match_bbox_pred,
-                        prev_match_bbox_pred,
                         match_cls_score,
-                    )
-                    layer_bank = None if prototype_bank is None else prototype_bank[i]
-                    layer_count = None if prototype_count is None else prototype_count[i]
-                    proto_mix, proto_available = mix_query_prototypes(
-                        match_cls_score,
-                        layer_bank,
-                        layer_count,
+                        prototype_bank,
+                        prototype_count,
                         min_count=prototype_min_count,
-                    )
-                    refined_match_query_feat, _ = self.prototype_refiner(
-                        match_query_feat,
-                        proto_mix,
-                        diff_score,
-                        proto_available,
                     )
 
                     if dn_pad_size > 0:
@@ -207,8 +210,6 @@ class SparseBEVTransformerDecoder(BaseModule):
             else:
                 query_feat = layer_query_feat
 
-            prev_match_query_feat = layer_query_feat[:, dn_pad_size:].detach()
-            prev_match_bbox_pred = bbox_pred[:, dn_pad_size:].detach()
             query_bbox = bbox_pred.clone().detach()
 
             cls_scores.append(cls_score)
@@ -216,9 +217,8 @@ class SparseBEVTransformerDecoder(BaseModule):
 
         cls_scores = torch.stack(cls_scores)
         bbox_preds = torch.stack(bbox_preds)
-        query_feats = torch.stack(query_feats)
 
-        return cls_scores, bbox_preds, query_feats
+        return cls_scores, bbox_preds, final_query_feats
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
