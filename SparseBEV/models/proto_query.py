@@ -426,8 +426,7 @@ class PrototypeCrossAttention(nn.Module):
                  topk_classes=2,
                  num_heads=8,
                  attn_drop=0.1,
-                 ffn_hidden_dim=512,
-                 max_memory_tokens=None):
+                 ffn_hidden_dim=512):
         super(PrototypeCrossAttention, self).__init__()
         self.embed_dims = embed_dims
         self.num_classes = num_classes
@@ -436,11 +435,6 @@ class PrototypeCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dims // num_heads
         self.attn_drop = attn_drop
-        self.max_memory_tokens = (
-            max(1, int(max_memory_tokens))
-            if max_memory_tokens is not None
-            else max(1, self.topk_classes * self.num_prototypes)
-        )
         assert self.head_dim * num_heads == embed_dims
 
         self.query_norm = nn.LayerNorm(embed_dims)
@@ -477,36 +471,26 @@ class PrototypeCrossAttention(nn.Module):
             return query_feat
 
         cls_prob = normalize_query_logits(cls_score)
+        valid_classes = valid_slots.any(dim=-1)
+        if not torch.any(valid_classes):
+            return query_feat
+
+        cls_prob = cls_prob.masked_fill(~valid_classes.view(1, 1, -1), -1e4)
+        topk_classes = min(self.topk_classes, cls_prob.shape[-1])
+        _, topk_class_inds = cls_prob.topk(topk_classes, dim=-1)
+
         prototype_bank = F.normalize(prototype_bank.to(query_feat.dtype), dim=-1, eps=1e-6)
-        flat_bank = prototype_bank.reshape(-1, self.embed_dims)
-        flat_valid = valid_slots.reshape(-1)
-        num_valid_tokens = int(flat_valid.sum().item())
-        if num_valid_tokens <= 0:
-            return query_feat
-
-        flat_count = prototype_count.reshape(-1).to(query_feat.dtype)
-        count_score = torch.log1p(flat_count)
-        valid_count = count_score[flat_valid]
-        count_score = count_score / valid_count.max().clamp(min=1.0)
-        count_score = 0.5 + 0.5 * count_score
-
-        slot_prior = cls_prob[:, :, :, None].expand(-1, -1, -1, self.num_prototypes)
-        slot_prior = slot_prior.reshape(*query_feat.shape[:2], -1)
-
-        query_score_feat = F.normalize(query_feat, dim=-1, eps=1e-6)
-        slot_similarity = torch.einsum('bqd,sd->bqs', query_score_feat, flat_bank)
-        slot_score = slot_prior * ((slot_similarity + 1.0) * 0.5)
-        slot_score = slot_score * count_score.view(1, 1, -1)
-        slot_score = slot_score.masked_fill(~flat_valid.view(1, 1, -1), -1e4)
-
-        topk_slots = min(self.max_memory_tokens, num_valid_tokens)
-        if topk_slots <= 0:
-            return query_feat
-
-        topk_score, topk_slot_inds = slot_score.topk(topk_slots, dim=-1)
-        prototype_tokens = flat_bank[topk_slot_inds.reshape(-1)]
-        prototype_tokens = prototype_tokens.reshape(*query_feat.shape[:2], topk_slots, self.embed_dims)
-        prototype_valid = topk_score > -1e3
+        prototype_tokens = prototype_bank[topk_class_inds.reshape(-1)]
+        prototype_tokens = prototype_tokens.reshape(
+            *query_feat.shape[:2],
+            topk_classes * self.num_prototypes,
+            self.embed_dims,
+        )
+        prototype_valid = valid_slots[topk_class_inds.reshape(-1)]
+        prototype_valid = prototype_valid.reshape(
+            *query_feat.shape[:2],
+            topk_classes * self.num_prototypes,
+        )
 
         query_has_proto = prototype_valid.any(dim=-1)
         if not torch.any(query_has_proto):

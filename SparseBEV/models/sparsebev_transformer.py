@@ -120,13 +120,6 @@ class SparseBEVTransformerDecoder(BaseModule):
                 num_heads=int(self.proto_query.get('prototype_attn_heads', 8)),
                 attn_drop=float(self.proto_query.get('prototype_attn_drop', 0.1)),
                 ffn_hidden_dim=int(self.proto_query.get('prototype_ffn_hidden_dim', 512)),
-                max_memory_tokens=int(self.proto_query.get(
-                    'prototype_topk_slots',
-                    self.proto_query.get(
-                        'prototype_topk_classes',
-                        2,
-                    ) * self.proto_query.get('num_prototypes', 8),
-                )),
             )
         else:
             self.prototype_cross_attention = None

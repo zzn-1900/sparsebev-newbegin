@@ -518,26 +518,25 @@
 - 只有 `prototype_count >= min_count` 的 slot 才参与
 - 如果没有任何有效 slot，直接返回原始 `query_feat`
 
-#### slot 打分逻辑
+#### prototype 选择逻辑
 
-当前 retrieval 不是“先选类别，再把该类所有 slot 全部送入 attention”，而是对所有有效 slot 逐个打分。
+当前 retrieval 采用的是“先选类别，再使用所选类别下的全部 slot”的方案。
 
-打分由三部分相乘：
+具体逻辑是：
 
-1. `cls_prob`
-2. `slot_similarity`
-3. `count_score`
+1. 对 `cls_score` 做归一化 sigmoid，得到 `cls_prob`
+2. 用 `valid_slots.any(dim=-1)` 得到哪些类别至少有一个成熟 slot
+3. 把没有成熟 slot 的类别在 `cls_prob` 中直接 mask 掉
+4. 按类别概率选 top `topk_classes` 个类别
+5. 对这几个类别，不再做 slot 级打分
+6. 直接把这些类别下的全部 slot 展开成 prototype tokens
 
-其中：
+因此当前 retrieval 的关键特点是：
 
-- `cls_prob` 来自归一化 sigmoid 分类概率
-- `slot_similarity` 是 query 与 slot prototype 的 cosine 相似度，经 `(sim + 1) / 2` 归一化
-- `count_score` 是 `log1p(count)` 再归一化后的成熟度分数
-
-然后：
-
-- 在所有有效 slot 中取 top `max_memory_tokens`
-- 只把这些最相关的 slot 作为 prototype token 送入 attention
+- 类别级选择使用 `cls_prob`
+- slot 级不再做额外排序
+- 所选类别下的所有 slot 都会进入 cross-attention
+- `prototype_count` 只用于判断 slot 是否成熟，不再参与 slot 分数计算
 
 #### attention 结构
 
@@ -649,7 +648,6 @@
 - `prototype_attn_heads`
 - `prototype_attn_drop`
 - `prototype_ffn_hidden_dim`
-- `prototype_topk_slots`
 
 其中当前配置里显式写出的只有：
 
@@ -661,9 +659,12 @@
 
 - `prototype_attn_drop = 0.1`
 - `prototype_ffn_hidden_dim = 512`
-- `prototype_topk_slots = prototype_topk_classes * num_prototypes`
 
-因此当前默认 `prototype_topk_slots = 16`。
+需要注意：
+
+- 当前 retrieval 不再按 slot 打分截断
+- 当前真正生效的是 `prototype_topk_classes`
+- 每个被选中的类别会直接使用该类别下的全部 `num_prototypes` 个 slots
 
 ### 6.3.6 decoder 主循环
 
@@ -1025,7 +1026,7 @@ _base_ = ['./r50_nuimg_704x256-quicktest.py']
 4. head 调用 transformer
 5. decoder 每层先执行原始 SparseBEV block
 6. 指定层把正常 query 拿出来
-7. `PrototypeCrossAttention` 从 bank 中选最相关 slot token
+7. `PrototypeCrossAttention` 先按类别选 top-k 类，再取这些类别下的全部 slot token
 8. refinement 后的 query 送入下一层
 9. 最后一层 query feature 作为 `final_query_feats` 返回给 head
 
@@ -1112,6 +1113,11 @@ _base_ = ['./r50_nuimg_704x256-quicktest.py']
 
 - 这些额外状态目前只服务于 bank 维护
 - 还没有进入 retrieval scoring
+
+另外还要注意：
+
+- 当前 retrieval 也不再做 slot 级打分
+- 它只按类别概率选 top-k 类，再直接展开这些类别下的全部成熟 slots
 
 ### 10.4 当前 `loss_proto` 只使用最后一层
 
