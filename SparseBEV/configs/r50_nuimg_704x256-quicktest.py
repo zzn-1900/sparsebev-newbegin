@@ -32,6 +32,7 @@ proto_query_cfg = dict(
     enabled=True,
     num_prototypes=8,
     memory_size_per_class=100,
+    query_bank_size=100,
     bank_momentum=0.99,
     min_memory_count=8,
     refine_layers=[0, 1, 2, 3, 4],
@@ -39,6 +40,11 @@ proto_query_cfg = dict(
     prototype_cross_attn=True,
     prototype_topk_classes=2,
     prototype_attn_heads=8,
+    query_merge_threshold=0.75,
+    query_new_threshold=0.55,
+    query_score_threshold=0.20,
+    query_dedup_threshold=0.95,
+    query_replace_threshold=0.30,
 )
 
 img_backbone = dict(

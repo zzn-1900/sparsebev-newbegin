@@ -76,33 +76,52 @@ class QueryPrototypeBank(nn.Module):
                  memory_size_per_class=100,
                  momentum=0.99,
                  recent_buffer_size=None,
+                 query_bank_size=None,
                  online_match_threshold=0.75,
+                 query_merge_threshold=None,
                  init_match_threshold=0.55,
+                 query_new_threshold=None,
                  maintenance_interval=64,
                  alpha_min=0.05,
                  alpha_max=0.20,
                  quality_gamma=0.10,
                  radius_gamma=0.10,
                  recent_score_threshold=0.20,
+                 query_score_threshold=None,
                  recent_dedup_threshold=0.95,
-                 radius_refresh_threshold=0.30):
+                 query_dedup_threshold=None,
+                 radius_refresh_threshold=0.30,
+                 query_replace_threshold=None):
         super(QueryPrototypeBank, self).__init__()
         self.num_classes = num_classes
         self.embed_dims = embed_dims
         self.num_prototypes = num_prototypes
         self.memory_size_per_class = memory_size_per_class
-        self.recent_buffer_size = memory_size_per_class if recent_buffer_size is None else max(1, int(recent_buffer_size))
+        if query_bank_size is None:
+            query_bank_size = recent_buffer_size
+        if query_merge_threshold is None:
+            query_merge_threshold = online_match_threshold
+        if query_new_threshold is None:
+            query_new_threshold = init_match_threshold
+        if query_score_threshold is None:
+            query_score_threshold = recent_score_threshold
+        if query_dedup_threshold is None:
+            query_dedup_threshold = recent_dedup_threshold
+        if query_replace_threshold is None:
+            query_replace_threshold = radius_refresh_threshold
+
+        self.query_bank_size = memory_size_per_class if query_bank_size is None else max(1, int(query_bank_size))
         self.momentum = momentum
-        self.online_match_threshold = float(online_match_threshold)
-        self.init_match_threshold = float(init_match_threshold)
+        self.query_merge_threshold = float(query_merge_threshold)
+        self.query_new_threshold = float(query_new_threshold)
         self.maintenance_interval = max(1, int(maintenance_interval))
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
         self.quality_gamma = float(quality_gamma)
         self.radius_gamma = float(radius_gamma)
-        self.recent_score_threshold = float(recent_score_threshold)
-        self.recent_dedup_threshold = float(recent_dedup_threshold)
-        self.radius_refresh_threshold = float(radius_refresh_threshold)
+        self.query_score_threshold = float(query_score_threshold)
+        self.query_dedup_threshold = float(query_dedup_threshold)
+        self.query_replace_threshold = float(query_replace_threshold)
 
         self.register_buffer('prototype_bank', torch.zeros(num_classes, num_prototypes, embed_dims))
         self.register_buffer('prototype_count', torch.zeros(num_classes, num_prototypes))
@@ -111,10 +130,13 @@ class QueryPrototypeBank(nn.Module):
         self.register_buffer('prototype_age', torch.zeros(num_classes, num_prototypes))
         self.register_buffer('prototype_updates', torch.zeros(1, dtype=torch.long))
 
-        self.register_buffer('recent_feats', torch.zeros(num_classes, self.recent_buffer_size, embed_dims))
-        self.register_buffer('recent_quality', torch.zeros(num_classes, self.recent_buffer_size))
-        self.register_buffer('recent_score', torch.full((num_classes, self.recent_buffer_size), -1e6))
-        self.register_buffer('recent_valid', torch.zeros(num_classes, self.recent_buffer_size, dtype=torch.bool))
+        # Per-class current query pool. Slots are refreshed from these tokens instead
+        # of from a historical recent buffer.
+        self.register_buffer('bank_query_feats', torch.zeros(num_classes, self.query_bank_size, embed_dims))
+        self.register_buffer('bank_query_support', torch.zeros(num_classes, self.query_bank_size))
+        self.register_buffer('bank_query_quality', torch.zeros(num_classes, self.query_bank_size))
+        self.register_buffer('bank_query_score', torch.full((num_classes, self.query_bank_size), -1e6))
+        self.register_buffer('bank_query_valid', torch.zeros(num_classes, self.query_bank_size, dtype=torch.bool))
 
     def get_valid_mask(self, min_count=0):
         return self.prototype_count >= float(min_count)
@@ -189,15 +211,14 @@ class QueryPrototypeBank(nn.Module):
                 continue
 
             touched_classes.append(cls_idx)
-            self._update_class_online(
+            self._update_class_query_bank(
                 cls_idx,
                 feats[cls_mask],
                 qualities[cls_mask],
             )
 
-        current_update = int(self.prototype_updates.item()) + 1
         for cls_idx in touched_classes:
-            self._maybe_maintain_class(cls_idx, current_update)
+            self._refresh_class_slots(cls_idx)
 
         self.prototype_updates += 1
 
@@ -206,167 +227,160 @@ class QueryPrototypeBank(nn.Module):
         return 0.1 + 0.9 * torch.sigmoid(quality)
 
     @torch.no_grad()
-    def _update_class_online(self, cls_idx, feats, qualities):
+    def _update_class_query_bank(self, cls_idx, feats, qualities):
         order = qualities.argsort(descending=True)
         for sample_idx in order.tolist():
             feat = feats[sample_idx]
             quality_weight = self._quality_to_weight(qualities[sample_idx]).to(feat.dtype)
-            self._update_single_query(cls_idx, feat, quality_weight)
+            self._update_query_bank_single(cls_idx, feat, quality_weight)
 
     @torch.no_grad()
-    def _update_single_query(self, cls_idx, feat, quality_weight):
-        valid_mask = self.prototype_count[cls_idx] > 0
+    def _update_query_bank_single(self, cls_idx, feat, quality_weight):
+        valid_mask = self.bank_query_valid[cls_idx]
         valid_inds = torch.nonzero(valid_mask, as_tuple=False).flatten()
+        candidate_score = self._compute_candidate_score(cls_idx, feat, quality_weight)
+        if candidate_score.item() < self.query_score_threshold:
+            return
 
         if valid_inds.numel() == 0:
-            self._init_slot(cls_idx, feat, quality_weight)
+            self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
             return
 
-        bank = F.normalize(self.prototype_bank[cls_idx, valid_inds], dim=-1, eps=1e-6)
-        similarity = torch.matmul(bank, feat)
+        exemplars = F.normalize(self.bank_query_feats[cls_idx, valid_inds], dim=-1, eps=1e-6)
+        similarity = torch.matmul(exemplars, feat)
         best_local = int(similarity.argmax().item())
-        best_slot = int(valid_inds[best_local].item())
-        best_sim = similarity[best_local].clamp(min=-1.0, max=1.0)
-        novelty = 1.0 - best_sim
+        best_idx = int(valid_inds[best_local].item())
+        best_sim = similarity[best_local].clamp(min=-1.0, max=1.0).item()
 
-        if valid_inds.numel() < self.num_prototypes and best_sim.item() < self.init_match_threshold:
-            self._init_slot(cls_idx, feat, quality_weight)
-            self._add_recent_candidate(cls_idx, feat, quality_weight, novelty)
+        if best_sim >= self.query_dedup_threshold:
+            self._merge_query_exemplar(cls_idx, best_idx, feat, quality_weight)
             return
 
-        self._online_update_slot(cls_idx, best_slot, feat, quality_weight, best_sim)
-        self._add_recent_candidate(cls_idx, feat, quality_weight, novelty)
+        if best_sim >= self.query_merge_threshold:
+            self._merge_query_exemplar(cls_idx, best_idx, feat, quality_weight)
+            return
+
+        if valid_inds.numel() < self.query_bank_size and best_sim < self.query_new_threshold:
+            self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
+            return
+
+        if valid_inds.numel() < self.query_bank_size:
+            self._merge_query_exemplar(cls_idx, best_idx, feat, quality_weight)
+            return
+
+        self._replace_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
+
+    def _compute_candidate_score(self, cls_idx, feat, quality_weight):
+        valid_mask = self.bank_query_valid[cls_idx]
+        if not torch.any(valid_mask):
+            novelty = feat.new_tensor(1.0)
+        else:
+            exemplars = F.normalize(self.bank_query_feats[cls_idx][valid_mask], dim=-1, eps=1e-6)
+            best_sim = torch.matmul(exemplars, feat).max().clamp(min=-1.0, max=1.0)
+            novelty = 1.0 - best_sim
+        return 0.5 * quality_weight + 0.5 * novelty
+
+    def _compute_bank_query_score(self, support, quality):
+        return torch.sqrt(support.clamp(min=1.0)) * (0.5 + quality)
 
     @torch.no_grad()
-    def _init_slot(self, cls_idx, feat, quality_weight):
-        empty_inds = torch.nonzero(self.prototype_count[cls_idx] <= 0, as_tuple=False).flatten()
+    def _add_query_exemplar(self, cls_idx, feat, quality_weight, candidate_score):
+        empty_inds = torch.nonzero(~self.bank_query_valid[cls_idx], as_tuple=False).flatten()
         if empty_inds.numel() == 0:
             return False
 
         slot_idx = int(empty_inds[0].item())
-        self.prototype_bank[cls_idx, slot_idx] = F.normalize(feat, dim=0, eps=1e-6)
-        self.prototype_count[cls_idx, slot_idx] = 1.0
-        self.prototype_quality[cls_idx, slot_idx] = quality_weight
-        self.prototype_radius[cls_idx, slot_idx] = 0.0
-        self.prototype_age[cls_idx, slot_idx] = 0.0
+        self.bank_query_feats[cls_idx, slot_idx] = F.normalize(feat, dim=0, eps=1e-6)
+        self.bank_query_support[cls_idx, slot_idx] = 1.0
+        self.bank_query_quality[cls_idx, slot_idx] = quality_weight
+        self.bank_query_score[cls_idx, slot_idx] = candidate_score
+        self.bank_query_valid[cls_idx, slot_idx] = True
         return True
 
     @torch.no_grad()
-    def _online_update_slot(self, cls_idx, slot_idx, feat, quality_weight, best_sim):
-        old_center = self.prototype_bank[cls_idx, slot_idx]
-        old_count = self.prototype_count[cls_idx, slot_idx]
-        old_quality = self.prototype_quality[cls_idx, slot_idx]
-        old_radius = self.prototype_radius[cls_idx, slot_idx]
+    def _merge_query_exemplar(self, cls_idx, exemplar_idx, feat, quality_weight):
+        old_feat = self.bank_query_feats[cls_idx, exemplar_idx]
+        old_support = self.bank_query_support[cls_idx, exemplar_idx]
+        old_quality = self.bank_query_quality[cls_idx, exemplar_idx]
 
         base_alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * quality_weight
-        base_alpha = base_alpha / torch.sqrt(old_count + 1.0)
-        if best_sim.item() < self.online_match_threshold:
-            base_alpha = base_alpha * 0.5
+        base_alpha = base_alpha / torch.sqrt(old_support + 1.0)
         alpha_floor = 0.0
-        if old_count.item() <= 1.0:
+        if old_support.item() <= 1.0:
             alpha_floor = self.alpha_min
-        elif old_count.item() <= 4.0:
+        elif old_support.item() <= 4.0:
             alpha_floor = max(1.0 - self.momentum, 0.01)
         alpha = base_alpha.clamp(min=alpha_floor, max=self.alpha_max)
 
-        new_center = old_center * (1.0 - alpha) + feat * alpha
-        new_center = F.normalize(new_center, dim=0, eps=1e-6)
-        sample_radius = 1.0 - torch.matmul(old_center, feat).clamp(min=-1.0, max=1.0)
-
-        self.prototype_bank[cls_idx, slot_idx] = new_center
-        self.prototype_count[cls_idx, slot_idx] = old_count + 1.0
-        self.prototype_quality[cls_idx, slot_idx] = (
+        new_feat = old_feat * (1.0 - alpha) + feat * alpha
+        new_feat = F.normalize(new_feat, dim=0, eps=1e-6)
+        new_support = old_support + 1.0
+        new_quality = (
             (1.0 - self.quality_gamma) * old_quality + self.quality_gamma * quality_weight
         )
-        self.prototype_radius[cls_idx, slot_idx] = (
-            (1.0 - self.radius_gamma) * old_radius + self.radius_gamma * sample_radius
+        self.bank_query_feats[cls_idx, exemplar_idx] = new_feat
+        self.bank_query_support[cls_idx, exemplar_idx] = new_support
+        self.bank_query_quality[cls_idx, exemplar_idx] = new_quality
+        self.bank_query_score[cls_idx, exemplar_idx] = self._compute_bank_query_score(
+            new_support,
+            new_quality,
         )
-        self.prototype_age[cls_idx, slot_idx] = 0.0
 
     @torch.no_grad()
-    def _add_recent_candidate(self, cls_idx, feat, quality_weight, novelty):
-        score = quality_weight * (1.0 + novelty.clamp(min=0.0))
-        if score.item() < self.recent_score_threshold:
+    def _replace_query_exemplar(self, cls_idx, feat, quality_weight, candidate_score):
+        valid_mask = self.bank_query_valid[cls_idx]
+        valid_inds = torch.nonzero(valid_mask, as_tuple=False).flatten()
+        if valid_inds.numel() == 0:
+            self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
             return
 
-        valid_mask = self.recent_valid[cls_idx]
-        if torch.any(valid_mask):
-            existing_feats = self.recent_feats[cls_idx][valid_mask]
-            existing_sim = torch.matmul(existing_feats, feat)
-            best_existing = int(existing_sim.argmax().item())
-            if existing_sim[best_existing].item() >= self.recent_dedup_threshold:
-                valid_inds = torch.nonzero(valid_mask, as_tuple=False).flatten()
-                dst_idx = int(valid_inds[best_existing].item())
-                if score.item() > self.recent_score[cls_idx, dst_idx].item():
-                    self.recent_feats[cls_idx, dst_idx] = feat
-                    self.recent_quality[cls_idx, dst_idx] = quality_weight
-                    self.recent_score[cls_idx, dst_idx] = score
-                return
+        existing_feats = F.normalize(self.bank_query_feats[cls_idx, valid_inds], dim=-1, eps=1e-6)
+        existing_support = self.bank_query_support[cls_idx, valid_inds]
+        existing_quality = self.bank_query_quality[cls_idx, valid_inds]
 
-        empty_inds = torch.nonzero(~valid_mask, as_tuple=False).flatten()
-        if empty_inds.numel() > 0:
-            dst_idx = int(empty_inds[0].item())
+        if existing_feats.shape[0] > 1:
+            pairwise = torch.matmul(existing_feats, existing_feats.transpose(0, 1))
+            pairwise.fill_diagonal_(-1.0)
+            redundancy = pairwise.max(dim=-1).values.clamp(min=0.0, max=1.0)
         else:
-            min_score_idx = int(self.recent_score[cls_idx].argmin().item())
-            if score.item() <= self.recent_score[cls_idx, min_score_idx].item():
-                return
-            dst_idx = min_score_idx
+            redundancy = existing_quality.new_zeros(existing_quality.shape)
 
-        self.recent_feats[cls_idx, dst_idx] = feat
-        self.recent_quality[cls_idx, dst_idx] = quality_weight
-        self.recent_score[cls_idx, dst_idx] = score
-        self.recent_valid[cls_idx, dst_idx] = True
+        support_score = torch.sqrt(existing_support.clamp(min=1.0))
+        support_score = support_score / support_score.max().clamp(min=1e-6)
+        utility = 0.45 * support_score + 0.35 * existing_quality + 0.20 * (1.0 - redundancy)
+
+        replace_local = int(utility.argmin().item())
+        best_sim = torch.matmul(existing_feats, feat).max().clamp(min=-1.0, max=1.0)
+        candidate_utility = 0.5 * quality_weight + 0.5 * (1.0 - best_sim)
+        if (candidate_utility.item() < utility[replace_local].item()
+                and candidate_utility.item() < self.query_replace_threshold):
+            return
+
+        replace_idx = int(valid_inds[replace_local].item())
+        self.bank_query_feats[cls_idx, replace_idx] = F.normalize(feat, dim=0, eps=1e-6)
+        self.bank_query_support[cls_idx, replace_idx] = 1.0
+        self.bank_query_quality[cls_idx, replace_idx] = quality_weight
+        self.bank_query_score[cls_idx, replace_idx] = candidate_score
+        self.bank_query_valid[cls_idx, replace_idx] = True
 
     @torch.no_grad()
-    def _maybe_maintain_class(self, cls_idx, current_update):
-        recent_mask = self.recent_valid[cls_idx]
-        num_recent = int(recent_mask.sum().item())
-        if num_recent == 0:
+    def _refresh_class_slots(self, cls_idx):
+        query_mask = self.bank_query_valid[cls_idx]
+        query_feats = self.bank_query_feats[cls_idx][query_mask]
+        query_support = self.bank_query_support[cls_idx][query_mask]
+        query_quality = self.bank_query_quality[cls_idx][query_mask].clamp(min=0.05)
+
+        if query_feats.numel() == 0:
+            self.prototype_bank[cls_idx].zero_()
+            self.prototype_count[cls_idx].zero_()
+            self.prototype_quality[cls_idx].zero_()
+            self.prototype_radius[cls_idx].zero_()
+            self.prototype_age[cls_idx].zero_()
             return
 
-        valid_mask = self.prototype_count[cls_idx] > 0
-        num_valid = int(valid_mask.sum().item())
-        need_fill = num_valid < self.num_prototypes
-        interval_hit = (current_update % self.maintenance_interval) == 0
-        recent_trigger = num_recent >= max(2, self.num_prototypes // 2)
-        drift_trigger = False
-        if num_valid > 0:
-            drift_trigger = self.prototype_radius[cls_idx, valid_mask].max().item() >= self.radius_refresh_threshold
-
-        if not (need_fill or interval_hit or recent_trigger or drift_trigger):
-            return
-
-        self._recluster_class(cls_idx)
-
-    @torch.no_grad()
-    def _recluster_class(self, cls_idx):
-        slot_mask = self.prototype_count[cls_idx] > 0
-        recent_mask = self.recent_valid[cls_idx]
-
-        slot_feats = self.prototype_bank[cls_idx][slot_mask]
-        slot_count = self.prototype_count[cls_idx][slot_mask]
-        slot_quality = self.prototype_quality[cls_idx][slot_mask].clamp(min=0.05)
-        recent_feats = self.recent_feats[cls_idx][recent_mask]
-        recent_quality = self.recent_quality[cls_idx][recent_mask].clamp(min=0.05)
-
-        if slot_feats.numel() == 0 and recent_feats.numel() == 0:
-            return
-
-        support_list = []
-        quality_list = []
-        feat_list = []
-        if slot_feats.numel() > 0:
-            feat_list.append(slot_feats)
-            support_list.append(slot_count)
-            quality_list.append(slot_quality)
-        if recent_feats.numel() > 0:
-            feat_list.append(recent_feats)
-            support_list.append(recent_feats.new_ones((recent_feats.shape[0],)))
-            quality_list.append(recent_quality)
-
-        tokens = torch.cat(feat_list, dim=0)
-        support = torch.cat(support_list, dim=0)
-        quality = torch.cat(quality_list, dim=0)
+        tokens = query_feats
+        support = query_support
+        quality = query_quality
         weights = torch.sqrt(support.clamp(min=1.0)) * (0.5 + quality)
 
         num_slots = min(self.num_prototypes, tokens.shape[0])
@@ -411,11 +425,7 @@ class QueryPrototypeBank(nn.Module):
         self.prototype_count[cls_idx] = new_count
         self.prototype_quality[cls_idx] = new_quality
         self.prototype_radius[cls_idx] = new_radius
-
-        self.recent_feats[cls_idx].zero_()
-        self.recent_quality[cls_idx].zero_()
-        self.recent_score[cls_idx].fill_(-1e6)
-        self.recent_valid[cls_idx].zero_()
+        self.prototype_age[cls_idx].zero_()
 
 
 class PrototypeCrossAttention(nn.Module):

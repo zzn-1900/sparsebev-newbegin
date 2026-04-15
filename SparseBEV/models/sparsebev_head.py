@@ -53,7 +53,10 @@ class SparseBEVHead(DETRHead):
         self.proto_enabled = bool(self.proto_query.get('enabled', False))
         self.proto_refine_layers = ()
         self.proto_num_prototypes = int(self.proto_query.get('num_prototypes', 8))
-        self.proto_memory_size = int(self.proto_query.get('memory_size_per_class', 100))
+        self.proto_memory_size = int(self.proto_query.get(
+            'query_bank_size',
+            self.proto_query.get('memory_size_per_class', 100),
+        ))
         self.proto_min_count = int(self.proto_query.get(
             'min_memory_count',
             self.proto_query.get('min_proto_count', 32),
@@ -74,17 +77,26 @@ class SparseBEVHead(DETRHead):
                 num_prototypes=self.proto_num_prototypes,
                 memory_size_per_class=self.proto_memory_size,
                 momentum=float(self.proto_query.get('bank_momentum', 0.99)),
-                recent_buffer_size=int(self.proto_query.get(
-                    'recent_buffer_size',
-                    self.proto_memory_size,
+                query_bank_size=int(self.proto_query.get(
+                    'query_bank_size',
+                    self.proto_query.get(
+                        'recent_buffer_size',
+                        self.proto_memory_size,
+                    ),
                 )),
-                online_match_threshold=float(self.proto_query.get(
-                    'online_match_threshold',
-                    0.75,
+                query_merge_threshold=float(self.proto_query.get(
+                    'query_merge_threshold',
+                    self.proto_query.get(
+                        'online_match_threshold',
+                        0.75,
+                    ),
                 )),
-                init_match_threshold=float(self.proto_query.get(
-                    'init_match_threshold',
-                    0.55,
+                query_new_threshold=float(self.proto_query.get(
+                    'query_new_threshold',
+                    self.proto_query.get(
+                        'init_match_threshold',
+                        0.55,
+                    ),
                 )),
                 maintenance_interval=int(self.proto_query.get(
                     'maintenance_interval',
@@ -94,17 +106,26 @@ class SparseBEVHead(DETRHead):
                 alpha_max=float(self.proto_query.get('proto_alpha_max', 0.20)),
                 quality_gamma=float(self.proto_query.get('proto_quality_gamma', 0.10)),
                 radius_gamma=float(self.proto_query.get('proto_radius_gamma', 0.10)),
-                recent_score_threshold=float(self.proto_query.get(
-                    'recent_score_threshold',
-                    0.20,
+                query_score_threshold=float(self.proto_query.get(
+                    'query_score_threshold',
+                    self.proto_query.get(
+                        'recent_score_threshold',
+                        0.20,
+                    ),
                 )),
-                recent_dedup_threshold=float(self.proto_query.get(
-                    'recent_dedup_threshold',
-                    0.95,
+                query_dedup_threshold=float(self.proto_query.get(
+                    'query_dedup_threshold',
+                    self.proto_query.get(
+                        'recent_dedup_threshold',
+                        0.95,
+                    ),
                 )),
-                radius_refresh_threshold=float(self.proto_query.get(
-                    'radius_refresh_threshold',
-                    0.30,
+                query_replace_threshold=float(self.proto_query.get(
+                    'query_replace_threshold',
+                    self.proto_query.get(
+                        'radius_refresh_threshold',
+                        0.30,
+                    ),
                 )),
             )
 

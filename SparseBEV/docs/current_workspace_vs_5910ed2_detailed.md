@@ -140,7 +140,7 @@
 6. `SparseBEVHead` 根据 GT 匹配结果计算 query quality
 7. `SparseBEVHead` 计算 `loss_proto`
 8. `SparseBEVHead` 用正样本 query 在线更新 bank
-9. bank 内部按类进行空 slot 初始化、在线 slot 更新、recent buffer 缓存、局部重聚类维护
+9. bank 内部先维护每类“当前 query exemplar 池”，再从当前池里按固定簇数刷新 slot
 
 ## 6. 逐文件详细差异
 
@@ -252,17 +252,19 @@
 | `prototype_radius` | `[num_classes, num_prototypes]` | 每个 slot 的离散度 |
 | `prototype_age` | `[num_classes, num_prototypes]` | 每个 slot 距离上次更新的时间 |
 | `prototype_updates` | `[1]` | 全局更新次数 |
-| `recent_feats` | `[num_classes, recent_buffer_size, C]` | 最近保留的候选 query |
-| `recent_quality` | `[num_classes, recent_buffer_size]` | recent query 的质量权重 |
-| `recent_score` | `[num_classes, recent_buffer_size]` | recent query 的综合分数 |
-| `recent_valid` | `[num_classes, recent_buffer_size]` | recent buffer 有效位 |
+| `bank_query_feats` | `[num_classes, query_bank_size, C]` | 当前 bank 中保留的 query exemplar |
+| `bank_query_support` | `[num_classes, query_bank_size]` | 每个 exemplar 代表的支持度 |
+| `bank_query_quality` | `[num_classes, query_bank_size]` | 每个 exemplar 的质量统计 |
+| `bank_query_score` | `[num_classes, query_bank_size]` | exemplar 的候选分数缓存 |
+| `bank_query_valid` | `[num_classes, query_bank_size]` | 当前 query bank 槽位有效位 |
 
 这里有几个必须说明的细节：
 
 - 当前 bank 不再按 decoder layer 单独维护。
 - 当前 bank 是类别级共享 bank。
-- 当前 `memory_size_per_class` 不再表示旧实现中的完整 class memory 池大小。
-- 当前代码中 `memory_size_per_class` 主要作为 `recent_buffer_size` 的默认值来源。
+- 当前 `memory_size_per_class` 现在更接近“每类当前 query bank pool 的容量”。
+- 当前更推荐显式使用 `query_bank_size`；旧的 `recent_buffer_size` 现在只是兼容别名。
+- 当前 slot 的分布不是从“历史 recent buffer”里维护出来的，而是从“bank 里当前仍然存在的 query exemplar”重新刷出来的。
 
 ### 6.2.7 `get_valid_mask`
 
@@ -322,14 +324,15 @@
 1. 对 `feats`、`labels`、`qualities` 做 `detach`
 2. 用 `_all_gather_tensor` 聚合多卡数据
 3. 对 `feats` 做归一化
-4. 对每个出现的类别调用 `_update_class_online`
-5. 对被触达的类别调用 `_maybe_maintain_class`
+4. 对每个出现的类别调用 `_update_class_query_bank`
+5. 对被触达的类别调用 `_refresh_class_slots`
 6. 增加 `prototype_updates`
 
 额外细节：
 
 - 每次更新前，所有已有 slot 的 `prototype_age` 会加一
-- 只有被当前 batch 触达的类别，才会进入在线更新和维护流程
+- 只有被当前 batch 触达的类别，才会进入 query bank 更新和 slot 重刷流程
+- `slot` 的最终形状始终来自该类当前 `bank_query_feats` 的整体分布，而不是来自额外的历史候选缓存
 
 ### 6.2.11 `_quality_to_weight`
 
@@ -346,11 +349,11 @@
 - 避免质量过低时完全失去作用
 - 避免质量过高时过度放大
 
-### 6.2.12 `_update_class_online`
+### 6.2.12 `_update_class_query_bank`
 
 功能：
 
-- 对某个类别的一批正样本 query 逐个做在线更新
+- 对某个类别的一批正样本 query 逐个更新“当前 query bank 池”
 
 细节：
 
@@ -359,120 +362,128 @@
 
 这意味着：
 
-- 当前实现优先让高质量样本决定 prototype 的演化方向
+- 当前实现优先让高质量样本决定“哪些 query 进入当前 bank”
 
-### 6.2.13 `_update_single_query`
+### 6.2.13 `_update_query_bank_single`
 
 功能：
 
-- 用单个高质量 query 更新对应类别的 bank
+- 用单个 query 更新对应类别的当前 query bank exemplar
 
 分支逻辑如下：
 
-1. 如果该类当前一个 slot 都没有，直接 `_init_slot`
-2. 否则，计算 query 与该类所有有效 slot 的相似度
-3. 找到最佳 slot 和最佳相似度
-4. 如果当前 slot 数还没填满，并且最佳相似度低于 `init_match_threshold`，则新开一个 slot
-5. 否则，对最佳 slot 做在线更新
-6. 同时把该 query 作为候选放进 recent buffer
+1. 先计算该 query 的 `candidate_score`
+2. 如果 `candidate_score < query_score_threshold`，直接丢弃
+3. 如果该类当前一个 exemplar 都没有，直接 `_add_query_exemplar`
+4. 否则，计算它与该类所有有效 exemplar 的相似度
+5. 如果最佳相似度高于 `query_dedup_threshold` 或 `query_merge_threshold`，则 `_merge_query_exemplar`
+6. 如果 bank 还没满，且最佳相似度低于 `query_new_threshold`，则新开一个 exemplar
+7. 如果 bank 还没满但也不够新颖，则并入当前最相近 exemplar
+8. 如果 bank 已满，则调用 `_replace_query_exemplar`
 
-这就是当前代码的冷启动和增量扩容策略。
+这就是当前代码的冷启动、增量扩容和满池替换策略。
 
-### 6.2.14 `_init_slot`
-
-功能：
-
-- 在该类还有空 slot 的情况下，用当前 query 初始化一个新 slot
-
-初始化内容：
-
-- `prototype_bank = normalize(feat)`
-- `prototype_count = 1.0`
-- `prototype_quality = quality_weight`
-- `prototype_radius = 0.0`
-- `prototype_age = 0.0`
-
-这部分是当前训练能正常启动的重要原因：
-
-- 即使 bank 最开始全空，也可以随着高质量正样本逐步填充 slot
-- 不需要额外 warmup hook 才能让训练跑起来
-
-### 6.2.15 `_online_update_slot`
+### 6.2.14 `_compute_candidate_score`
 
 功能：
 
-- 对已有 slot 做在线增量更新
+- 衡量一个新 query 是否值得进入当前 bank
+
+公式：
+
+- 如果该类当前还没有 exemplar，则 `novelty = 1.0`
+- 否则，先找与当前 bank 中最相近 exemplar 的最大相似度 `best_sim`
+- `novelty = 1.0 - best_sim`
+- `candidate_score = 0.5 * quality_weight + 0.5 * novelty`
+
+这部分的含义是：
+
+- query 必须同时兼顾质量和新颖性，才更容易进入 bank
+- 当前并不是“来一个正样本就一定记住”
+
+### 6.2.15 `_add_query_exemplar`
+
+功能：
+
+- 在该类还有空位时，往当前 query bank 里新增一个 exemplar
+
+写入内容：
+
+- `bank_query_feats = normalize(feat)`
+- `bank_query_support = 1.0`
+- `bank_query_quality = quality_weight`
+- `bank_query_score = candidate_score`
+- `bank_query_valid = True`
+
+这一部分直接保证了冷启动可用：
+
+- 即使训练一开始 bank 完全为空，也能被第一批高质量正样本逐步填充
+- 不需要额外 warmup hook，训练可以直接起跑
+
+### 6.2.16 `_merge_query_exemplar`
+
+功能：
+
+- 对已有 exemplar 做增量融合
 
 核心变量：
 
-- `old_center`
-- `old_count`
+- `old_feat`
+- `old_support`
 - `old_quality`
-- `old_radius`
 
 步长 `alpha` 的来源：
 
 1. 先根据 `quality_weight` 在线性区间 `[alpha_min, alpha_max]` 内生成基础步长
-2. 再按 `1 / sqrt(count + 1)` 衰减
-3. 如果 query 与 slot 的相似度低于 `online_match_threshold`，再额外减半
-4. 如果 slot 很新，则给一个下界：
-   - `count <= 1` 时，下界为 `alpha_min`
-   - `1 < count <= 4` 时，下界为 `max(1 - momentum, 0.01)`
-
-需要特别说明：
-
-- 当前 `momentum` 不再直接作为旧实现那种 prototype EMA 系数使用
-- 当前 `momentum` 只间接影响“新 slot 在早期阶段的最小更新下界”
+2. 再按 `1 / sqrt(support + 1)` 衰减
+3. 如果 exemplar 很新，则给一个更新下界：
+   - `support <= 1` 时，下界为 `alpha_min`
+   - `1 < support <= 4` 时，下界为 `max(1 - momentum, 0.01)`
 
 更新内容：
 
-- 更新中心向量
-- `prototype_count += 1`
-- `prototype_quality` 做 EMA
-- `prototype_radius` 做 EMA
-- `prototype_age = 0`
+- `bank_query_feats` 按 `alpha` 融合后重新归一化
+- `bank_query_support += 1`
+- `bank_query_quality` 用 `quality_gamma` 做 EMA
+- `bank_query_score` 用 `_compute_bank_query_score` 更新
 
-### 6.2.16 `_add_recent_candidate`
+需要特别说明：
 
-功能：
+- 当前 `momentum` 不再直接作为旧实现里 prototype EMA 的主系数
+- 它现在主要影响“新 exemplar 在早期阶段的最小更新下界”
 
-- 把“高质量且有新颖性”的 query 放入 recent buffer
-
-细节：
-
-- `score = quality_weight * (1 + novelty)`
-- 如果 `score < recent_score_threshold`，则不进入 buffer
-- 如果和已有 recent token 太像，且相似度高于 `recent_dedup_threshold`，则只在更优时替换
-- 如果 buffer 没满，直接插入空位
-- 如果 buffer 已满，则替换当前最低分样本，但前提是新样本更好
-
-这相当于一个按质量和新颖性维护的小型候选池。
-
-### 6.2.17 `_maybe_maintain_class`
+### 6.2.17 `_replace_query_exemplar`
 
 功能：
 
-- 决定某个类别是否要触发局部维护
+- 当 query bank 已满时，决定是否用新 query 替换掉一个旧 exemplar
 
-触发条件包括：
+步骤：
 
-- `need_fill`：该类当前 slot 数还没填满
-- `interval_hit`：达到 `maintenance_interval`
-- `recent_trigger`：recent buffer 中候选积累到一定数量
-- `drift_trigger`：当前该类某个 slot 的 `prototype_radius` 超过阈值
+1. 取出当前该类所有有效 exemplar
+2. 计算 exemplar 两两相似度，得到冗余度 `redundancy`
+3. 用 `support`、`quality`、`redundancy` 构造 utility
+4. 找到 utility 最低、最值得被替换的 exemplar
+5. 计算新 query 的 `candidate_utility`
+6. 如果新 query 既不比最差 exemplar 更值钱，且也没达到 `query_replace_threshold`，则放弃
+7. 否则直接用新 query 覆盖这个 exemplar，并把其 `support` 重置为 1
 
-这意味着当前实现不是每次更新都整类重刷，而是“在线更新为主，局部维护为辅”。
+这里的关键点是：
 
-### 6.2.18 `_recluster_class`
+- bank 满了以后，不是继续无限累积历史，而是维持一个固定容量的“当前代表池”
+- 替换时考虑了质量、代表性和冗余度，不是单纯按最新时间戳覆盖
+
+### 6.2.18 `_refresh_class_slots`
 
 功能：
 
-- 对某个类别执行一次局部重聚类维护
+- 从该类当前仍然保存在 bank 中的所有 query exemplar，重新生成固定数量的 prototype slots
 
 输入 token 来源：
 
-- 当前已有 slot
-- recent buffer 中的候选 query
+- 只来自 `bank_query_feats`
+- 不再拼接旧 slot
+- 不再拼接 recent/history buffer
 
 每个 token 的权重构成：
 
@@ -480,24 +491,24 @@
 
 流程：
 
-1. 合并现有 slot 和 recent token
+1. 读取该类当前有效 `bank_query_feats / support / quality`
 2. 计算权重
 3. 用 `_select_weighted_diverse_indices` 选 seed
-4. 把所有 token 分配到最近 seed
-5. 每个簇内部用 `_select_weighted_medoid` 选代表原型
+4. 把所有当前 bank query 分配到最近 seed
+5. 每个簇内部用 `_select_weighted_medoid` 选代表 slot
 6. 统计每个簇的：
    - `new_bank`
    - `new_count`
    - `new_quality`
    - `new_radius`
-7. 清空该类旧状态并用新簇结果替换
-8. 清空该类 recent buffer
+7. 清空该类旧 slot 状态并用新簇结果替换
 
 这里还需要说明几个关键点：
 
-- 当前维护是“按类局部维护”，不是全局重聚类
-- 当前重聚类后 `prototype_count` 的语义是该簇的支持度总和
-- 这比旧版“每个 slot 写整类总样本数”更有表达力
+- 当前是“按类固定簇数”的重刷，不是跨类别全局聚类
+- 当前 slot 的分布只依赖“bank 里现在还存在的 exemplar”
+- `prototype_count` 的语义是该簇聚合后的支持度总和
+- `prototype_radius` 是当前 bank exemplar 相对该 slot medoid 的加权离散度
 
 ### 6.2.19 `PrototypeCrossAttention`
 
@@ -724,19 +735,24 @@
 | 参数 | 当前默认值 | 说明 |
 | --- | --- | --- |
 | `num_prototypes` | 8 | 每类 slot 数 |
-| `memory_size_per_class` | 100 | 当前主要作为 `recent_buffer_size` 默认来源 |
+| `memory_size_per_class` | 100 | 每类当前 query bank pool 的默认容量 |
 | `bank_momentum` | 0.99 | 当前只间接影响早期更新下界 |
-| `recent_buffer_size` | `memory_size_per_class` | recent buffer 长度 |
-| `online_match_threshold` | 0.75 | 在线更新是否算“足够接近” |
-| `init_match_threshold` | 0.55 | bank 未满时是否开新 slot |
+| `query_bank_size` | `memory_size_per_class` | 每类当前 query bank 的容量 |
+| `query_merge_threshold` | 0.75 | 新 query 与已有 exemplar 多接近时直接合并 |
+| `query_new_threshold` | 0.55 | bank 未满时是否值得新开 exemplar |
 | `maintenance_interval` | 64 | 局部维护周期 |
 | `proto_alpha_min` | 0.05 | 在线更新最小步长基值 |
 | `proto_alpha_max` | 0.20 | 在线更新最大步长基值 |
 | `proto_quality_gamma` | 0.10 | slot 质量 EMA 系数 |
 | `proto_radius_gamma` | 0.10 | slot 半径 EMA 系数 |
-| `recent_score_threshold` | 0.20 | recent buffer 进入门槛 |
-| `recent_dedup_threshold` | 0.95 | recent buffer 去重阈值 |
-| `radius_refresh_threshold` | 0.30 | 根据簇离散度触发维护的阈值 |
+| `query_score_threshold` | 0.20 | query 进入当前 bank 的最低门槛 |
+| `query_dedup_threshold` | 0.95 | 与已有 exemplar 极其相近时直接去重合并 |
+| `query_replace_threshold` | 0.30 | 满池时新 query 至少要达到的替换强度 |
+
+兼容性说明：
+
+- 当前代码仍兼容旧 key：`recent_buffer_size`、`online_match_threshold`、`init_match_threshold`、`recent_score_threshold`、`recent_dedup_threshold`、`radius_refresh_threshold`
+- 但这些旧名字已经不再代表“history / recent buffer”语义，后续建议统一改用 `query_bank_*` 命名
 
 当前主配置并没有把这些扩展超参全部写出来，很多值仍然依赖默认值。
 
@@ -907,6 +923,7 @@ loss_proto = 1 - cosine(query_feat, matched_slot_proto)
 | `enabled` | `True` |
 | `num_prototypes` | `8` |
 | `memory_size_per_class` | `100` |
+| `query_bank_size` | `100` |
 | `bank_momentum` | `0.99` |
 | `min_memory_count` | `8` |
 | `refine_layers` | `[0, 1, 2, 3, 4]` |
@@ -914,6 +931,11 @@ loss_proto = 1 - cosine(query_feat, matched_slot_proto)
 | `prototype_cross_attn` | `True` |
 | `prototype_topk_classes` | `2` |
 | `prototype_attn_heads` | `8` |
+| `query_merge_threshold` | `0.75` |
+| `query_new_threshold` | `0.55` |
+| `query_score_threshold` | `0.20` |
+| `query_dedup_threshold` | `0.95` |
+| `query_replace_threshold` | `0.30` |
 
 ### 6.5.2 接入位置
 
@@ -1045,11 +1067,10 @@ _base_ = ['./r50_nuimg_704x256-quicktest.py']
 1. bank 收到多卡聚合后的正样本
 2. 每个类别按 quality 从高到低处理
 3. 对每个 query：
-   - 若类内没有 slot，则新建
-   - 若 bank 未满且与已有 slot 差异足够大，则新建
-   - 否则在线更新最近 slot
-4. 同时把高质量高新颖性的 query 放进 recent buffer
-5. 满足条件时，对该类做一次局部重聚类维护
+   - 若类内没有 exemplar，则新建
+   - 若 bank 未满且与已有 exemplar 差异足够大，则新建
+   - 否则并入最近 exemplar，或者在满池时替换代表性差的 exemplar
+4. 处理完该类当前 batch 后，从当前 `bank_query_feats` 重新刷新固定数量的 slots
 
 ## 9. 明确未改动的部分
 
@@ -1079,11 +1100,11 @@ _base_ = ['./r50_nuimg_704x256-quicktest.py']
 
 当前代码里：
 
-- 它本身只保存为字段
-- 真正被使用的是 `recent_buffer_size`
-- 默认情况下 `recent_buffer_size = memory_size_per_class`
+- 它现在更接近“每类当前 query bank 的容量”
+- 如果显式写了 `query_bank_size`，优先使用 `query_bank_size`
+- 旧的 `recent_buffer_size` 还兼容，但只是旧名字别名
 
-因此如果后面要继续加 memory 机制，不要误以为当前仍然存在旧版完整 memory 池。
+因此如果后面要继续加 memory 机制，不要误以为当前仍然存在一个独立的 historical recent buffer。
 
 ### 10.2 `momentum` 的语义已经变化
 
