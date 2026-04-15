@@ -1,175 +1,167 @@
-# 当前工作区相对 `5910ed2` 的完整差异说明
+# 当前工作区相对 `5910ed2` 的累计改动清单
 
-## 1. 文档目的
+## 1. 比较口径
 
-本文档的目标是把当前工作区中与 prototype 相关的真实代码状态完整梳理清楚，作为后续继续修改时的基线说明。
+- 基线提交: `5910ed2f47e77eccf765af6e39106f33c7f190f8` (`Initial commit`)
+- 当前代码状态: 本地工作区在撰写本文档前的真实代码状态
+- 当前分支状态: `prototype`，`HEAD = 9cacb16`，相对 `origin/prototype` 超前 1 个提交
 
-本文档同时回答三件事：
+说明:
 
-1. 初始提交 `5910ed2f47e77eccf765af6e39106f33c7f190f8` 中模型是什么样子。
-2. 当前工作区相对初始提交具体改了什么。
-3. 当前工作区真实代码，与仓库中已有文档 `proto_temporal_sparsebev_design.md` 和 `changes_vs_initial_branch.md` 有哪些不一致。
-
-本文档的比较对象是：
-
-- 基线：`5910ed2f47e77eccf765af6e39106f33c7f190f8`
-- 当前状态：当前工作区，包括尚未提交的本地修改
-
-注意：
-
-- 当前工作区不是单次改动，而是在已提交版本 `eee8f981d9c26fcc2e4fc8f903174b8ca46b34d9` 的基础上继续演化。
-- 因此，旧文档中描述的方案并不等于当前代码真实实现。
+- 下面“累计改动”统计的是 `git diff 5910ed2f47e77eccf765af6e39106f33c7f190f8` 的结果。
+- 为了避免自引用，本文档本身不计入下面的模型改动统计。
+- 当前工作区里还存在少量相对 `HEAD` 的未提交删除项，这部分单独列在文末“附录”中。
 
 ## 2. 总体结论
 
-相对初始提交，当前工作区的核心变化集中在 `query / prototype / loss` 这条线上，采样链路、CUDA 算子、数据管线没有改。
+相对初始提交 `5910ed2`，当前工作区的核心变化非常集中，全部落在以下 6 个文件上:
 
-当前工作区已经从“原始 SparseBEV”变成“带 query-space prototype 机制的 SparseBEV”，并且这套 prototype 机制已经经历了两次方案变化：
+| 变更类型 | 文件 | 行数变化 |
+| --- | --- | --- |
+| A | `SparseBEV/configs/r50_nuimg_704x256-quicktest.py` | `+257 / -0` |
+| M | `SparseBEV/configs/r50_nuimg_704x256.py` | `+24 / -3` |
+| M | `SparseBEV/models/__init__.py` | `+11 / -9` |
+| A | `SparseBEV/models/proto_query.py` | `+554 / -0` |
+| M | `SparseBEV/models/sparsebev_head.py` | `+270 / -13` |
+| M | `SparseBEV/models/sparsebev_transformer.py` | `+120 / -10` |
 
-1. 第一阶段是“layer-wise prototype + difficulty-aware refinement”的方案。
-2. 当前工作区已经进一步演化成“class-level multi-slot prototype bank + online update + local maintenance + prototype cross-attention”的方案。
+累计统计:
 
-这意味着：
+- `6 files changed, 1236 insertions(+), 35 deletions(-)`
 
-- 当前代码不是最开始设计文档里的 `QueryDifficultyEstimator + PrototypeRefiner` 版本。
-- 当前代码也不是最开始变更文档里写的“按 decoder layer 维护单 prototype”版本。
-- 当前代码的真实结构，应以 `SparseBEV/models/proto_query.py`、`SparseBEV/models/sparsebev_transformer.py`、`SparseBEV/models/sparsebev_head.py` 为准。
+一句话概括当前代码状态:
 
-## 3. 与初始提交相比的文件变化
+- 当前仓库已经从“原始 SparseBEV”演化成“带 query prototype bank、prototype cross-attention refinement、prototype alignment loss、quicktest 配置”的版本。
 
-### 3.1 新增文件
+同样重要的是，当前改动没有碰下面这些模块:
 
-与 `5910ed2` 相比，当前工作区新增了下列相关文件：
+- `SparseBEV/models/sparsebev_sampling.py`
+- `SparseBEV/models/csrc/*`
+- `SparseBEV/loaders/*`
+- `SparseBEV/train.py`
+- `SparseBEV/val.py`
+- `SparseBEV/utils.py`
 
-| 文件 | 作用 |
-| --- | --- |
-| `SparseBEV/models/proto_query.py` | 新增 prototype bank、prototype retrieval、prototype cross-attention 的实现 |
-| `SparseBEV/configs/r50_nuimg_704x256-quicktest.py` | 便于快速实验的 mini 数据集配置 |
-| `SparseBEV/configs/r50_nuimg_704x256-quick.py` | 对 quicktest 配置的简单继承入口 |
-| `SparseBEV/docs/proto_temporal_sparsebev_design.md` | 早期设计文档，描述的是旧方案 |
-| `SparseBEV/docs/changes_vs_initial_branch.md` | 早期变更说明，描述的是旧阶段实现 |
+也就是说，这次累计改动没有改视角采样 CUDA 链路、数据集管线和训练入口，主要只改了 `config / head / transformer / prototype module` 这条线。
 
-另有一个 PDF 文件：
+## 3. 提交演进轨迹
 
-- `Xue_CorrBEV_Multi-View_3D_Object_Detection_by_Correlation_Learning_with_Multi-modal_CVPR_2025_paper.pdf`
+从 `5910ed2` 到当前 `HEAD`，中间共有 7 个后续提交:
 
-它不是模型代码的一部分。
+| 提交 | message | 备注 |
+| --- | --- | --- |
+| `dff681c` | `v1.0` | 首次落地 prototype 相关代码、文档、quicktest 配置 |
+| `eee8f98` | `v1.0` | 对主配置做小幅调整 |
+| `fe64248` | `初代版本` | prototype 模块、head、transformer 出现较大重写 |
+| `050d09c` | `更新` | 补充了对比说明文档 |
+| `f6b11d4` | `quick配置` | quicktest 配置与 prototype 细节继续调整 |
+| `a7fd826` | `优化簇更新机制` | prototype bank 的簇刷新/更新机制继续演化 |
+| `9cacb16` | `修bug` | 对 prototype 与 transformer 交互做 bugfix |
 
-### 3.2 修改文件
+从提交轨迹上看，prototype 相关能力不是一次性加完的，而是经历了“先接入、再重写、再优化簇更新、最后修 bug”的持续演化。
 
-与 `5910ed2` 相比，当前工作区修改了下列核心文件：
+## 4. 当前累计改动的真实功能面貌
 
-| 文件 | 改动类型 |
-| --- | --- |
-| `SparseBEV/models/__init__.py` | 导出新增模块 |
-| `SparseBEV/models/sparsebev_transformer.py` | 接入 prototype refinement |
-| `SparseBEV/models/sparsebev_head.py` | 接入 bank、prototype loss、bank update |
-| `SparseBEV/configs/r50_nuimg_704x256.py` | 接入 `proto_query_cfg` 并调整日志与评估频率 |
+如果只看当前工作区真实代码，当前能力可以概括成下面这条链路:
 
-## 4. 初始提交 `5910ed2` 的模型状态
+1. 主配置里新增 `proto_query_cfg`
+2. `SparseBEVHead` 根据配置构建 `QueryPrototypeBank`
+3. `SparseBEVHead.forward` 把 `prototype_bank / prototype_count / prototype_min_count / dn_pad_size` 传给 transformer
+4. `SparseBEVTransformerDecoder` 在指定 decoder 层后，对非 DN query 做 prototype cross-attention refinement
+5. `SparseBEVHead.loss` 用最后一层 decoder query 的正样本计算 `loss_proto`
+6. 同一批正样本 query 还会用于在线更新 prototype bank
 
-初始提交中的 `SparseBEV` 可以概括为“纯原始 SparseBEV”，没有任何 prototype 机制。
+需要特别注意的事实:
 
-### 4.1 `SparseBEV/models/sparsebev_transformer.py`
+- 当前实现是“按类别维护多 slot prototype bank”，不是“按 decoder layer 维护一套 bank”。
+- 当前 refinement 使用的是 `PrototypeCrossAttention`，不是旧设计里常见的 `QueryDifficultyEstimator + PrototypeRefiner` 组合。
+- 当前 `loss_proto` 和 bank update 只使用最后一层 decoder 的 query feature，不是每层都监督。
+- DN query 被显式排除在 prototype refinement 之外。
 
-初始状态下：
+## 5. 逐文件详细改动
 
-- `SparseBEVTransformer.__init__` 没有 `proto_query` 参数。
-- `SparseBEVTransformer.forward` 只接收：
-  - `query_bbox`
-  - `query_feat`
-  - `mlvl_feats`
-  - `attn_mask`
-  - `img_metas`
-- `SparseBEVTransformer.forward` 只返回：
-  - `cls_scores`
-  - `bbox_preds`
-- `SparseBEVTransformerDecoder` 只做原有 decoder 层堆叠，没有 prototype refinement。
-- decoder 每一层执行顺序是：
-  - 位置编码
-  - self attention
-  - image feature sampling
-  - adaptive mixing
-  - FFN
-  - 分类分支
-  - 回归分支
+### 5.1 `SparseBEV/configs/r50_nuimg_704x256.py`
 
-### 4.2 `SparseBEV/models/sparsebev_head.py`
+这是当前主训练配置，相对 `5910ed2` 的主要改动有 3 类。
 
-初始状态下：
+第一类是新增 `proto_query_cfg`，参数大致分为四组:
 
-- `SparseBEVHead.__init__` 没有 `proto_query` 参数。
-- head 不持有任何 prototype bank。
-- `forward` 只调用 transformer，拿到 `cls_scores` 和 `bbox_preds`。
-- `outs` 中没有 `final_query_feats` 或 `all_query_feats`。
-- `get_targets` 只返回：
-  - `labels_list`
-  - `label_weights_list`
-  - `bbox_targets_list`
-  - `bbox_weights_list`
-  - `num_total_pos`
-  - `num_total_neg`
-- `loss` 只包含：
-  - 分类损失
-  - bbox L1 损失
-  - DN loss
-- 没有正样本 query 质量建模。
-- 没有 `loss_proto`。
-- 没有训练时 bank 更新。
+- bank 规模:
+  - `num_prototypes=8`
+  - `memory_size_per_class=100`
+  - `query_bank_size=100`
+  - `bank_momentum=0.99`
+  - `min_memory_count=8`
+- refinement 行为:
+  - `refine_layers=[0, 1, 2, 3, 4]`
+  - `prototype_cross_attn=True`
+  - `prototype_topk_classes=2`
+  - `prototype_attn_heads=8`
+- loss 权重:
+  - `lambda_proto=0.1`
+- bank 更新阈值:
+  - `query_merge_threshold=0.75`
+  - `query_new_threshold=0.55`
+  - `query_score_threshold=0.20`
+  - `query_dedup_threshold=0.95`
+  - `query_replace_threshold=0.30`
 
-### 4.3 `SparseBEV/configs/r50_nuimg_704x256.py`
+第二类是把 `proto_query_cfg` 同时接到了两个入口:
 
-初始状态下：
+- `pts_bbox_head.proto_query=proto_query_cfg`
+- `transformer.proto_query=proto_query_cfg`
 
-- 没有 `proto_query_cfg`。
-- `SparseBEVHead` 和 `SparseBEVTransformer` 都没有 prototype 相关配置入口。
-- `log_config` 中：
-  - `MyTextLoggerHook.interval = 1`
-  - `MyTensorboardLoggerHook.interval = 500`
-- `eval_config.interval = total_epochs`
+第三类是训练可观测性调整:
 
-## 5. 当前工作区的真实模型结构
+- `MyTextLoggerHook.interval` 从 `1` 改成 `50`
+- `MyTensorboardLoggerHook.interval` 从 `500` 改成 `50`
+- `eval_config.interval` 从 `total_epochs` 改成 `1`
 
-当前工作区的真实实现不是旧文档描述的难度门控版本，而是下面这条链路：
+这说明当前主配置已经默认启用 prototype 机制，而且训练时会更频繁做评估，同时降低日志刷屏频率。
 
-1. 配置文件中定义 `proto_query_cfg`
-2. `SparseBEVHead` 根据配置构造 `QueryPrototypeBank`
-3. `SparseBEVHead.forward` 将 `prototype_bank`、`prototype_count` 传给 `SparseBEVTransformer`
-4. `SparseBEVTransformerDecoder` 在指定层之间，对正常 query 执行 `PrototypeCrossAttention`
-5. `SparseBEVHead.loss` 从最后一层 decoder query 中抽取正样本
-6. `SparseBEVHead` 根据 GT 匹配结果计算 query quality
-7. `SparseBEVHead` 计算 `loss_proto`
-8. `SparseBEVHead` 用正样本 query 在线更新 bank
-9. bank 内部先维护每类“当前 query exemplar 池”，再从当前池里按固定簇数刷新 slot
+### 5.2 `SparseBEV/configs/r50_nuimg_704x256-quicktest.py`
 
-## 6. 逐文件详细差异
+这是相对 `5910ed2` 新增的一份快速实验配置，本质上是主配置的一份轻量化实验副本。
 
-## 6.1 `SparseBEV/models/__init__.py`
+它的主要特点是:
 
-### 初始提交
+- 保留了和主配置同一套 `proto_query_cfg`
+- 仍然使用相同的 `SparseBEVHead` 和 `SparseBEVTransformer` 接线方式
+- 把数据注释文件换成了 `nuscenes_infos_*_mini_sweep.pkl`
+- `total_epochs` 改成 `5`
 
-初始提交中只导出：
+具体看数据部分:
 
-- `SparseBEV`
-- `SparseBEVHead`
-- `SparseBEVTransformer`
+- 训练集使用 `nuscenes_infos_train_mini_sweep.pkl`
+- 验证集使用 `nuscenes_infos_val_mini_sweep.pkl`
+- 测试集使用 `nuscenes_infos_test_mini_sweep.pkl`
 
-### 当前工作区
+因此它的用途很明确:
 
-当前工作区新增导出：
+- 不是新算法逻辑
+- 而是为了快速验证 prototype 相关改动是否能正常跑通
+
+### 5.3 `SparseBEV/models/__init__.py`
+
+这个文件的功能改动很小，但意义很明确。
+
+相对初始提交，它新增导出:
 
 - `QueryPrototypeBank`
 - `PrototypeCrossAttention`
 
-这说明当前仓库公开暴露的 prototype 相关实现只有这两个模块，没有导出 `QueryDifficultyEstimator` 或 `PrototypeRefiner`，因为当前代码中已经没有这两个类。
+这意味着 prototype 机制被正式纳入 `SparseBEV.models` 对外暴露的模块集合中。
 
-## 6.2 `SparseBEV/models/proto_query.py`
+从这里也可以反向确认一件事:
 
-这是当前工作区新增的核心文件，也是当前真实实现与旧文档差异最大的地方。
+- 当前仓库真正稳定落地的 prototype 相关核心对象就是这两个
+- 不是旧文档里提到的 `QueryDifficultyEstimator` 或 `PrototypeRefiner`
 
-### 6.2.1 文件中包含的对象
+### 5.4 `SparseBEV/models/proto_query.py`
 
-当前文件中实际存在：
+这是相对 `5910ed2` 新增的核心文件，也是当前所有改动里最关键的一部分。
+
+当前文件包含的主要对象如下:
 
 - `normalize_query_logits`
 - `_all_gather_tensor`
@@ -178,430 +170,148 @@
 - `QueryPrototypeBank`
 - `PrototypeCrossAttention`
 
-当前文件中实际不存在：
+#### 5.4.1 `normalize_query_logits`
 
-- `QueryDifficultyEstimator`
-- `PrototypeRefiner`
-- `mix_query_prototypes`
+当前 retrieval 前的类别分数不是直接 softmax，而是:
 
-### 6.2.2 `normalize_query_logits`
+1. 先对 `cls_score` 做 `sigmoid`
+2. 再沿类别维做归一化
 
-功能：
+这决定了 prototype cross-attention 在选 top-k 类别时使用的是“归一化后的 sigmoid 分类概率”。
 
-- 对分类分支输出 `cls_score` 先做 `sigmoid`
-- 再沿类别维度归一化
+#### 5.4.2 `_all_gather_tensor`
 
-这意味着当前 retrieval 使用的是“归一化后的 sigmoid 分类概率”，不是 softmax 分类概率。
+这个辅助函数解决的是 DDP 环境下的变长 tensor 汇总问题。
 
-### 6.2.3 `_all_gather_tensor`
+当前逻辑是:
 
-功能：
+- 先收集各卡样本数
+- 按最大长度做 padding
+- `all_gather`
+- 再按真实长度裁回
 
-- 在 DDP 环境下，把不同进程的变长 tensor 先 pad 再 all-gather
-- 最后按真实长度裁回并拼接
+用途:
 
-用途：
+- bank update 时收集不同 rank 上的正样本 query
+- 让 prototype bank 的更新来源跨卡一致
 
-- bank 更新时收集所有进程上的正样本 query
-- 保证 prototype bank 在多卡训练下的更新来源一致
+#### 5.4.3 `QueryPrototypeBank`
 
-### 6.2.4 `_select_weighted_diverse_indices`
+当前 bank 的结构不是 layer-wise，而是 class-wise multi-slot。
 
-功能：
+核心 buffer 包括:
 
-- 从一组特征里选择若干个“高权重且相互多样”的种子
-
-实现逻辑：
-
-- 先按 `weights` 归一化成 `weight_score`
-- 第一个种子取 `weight_score` 最大值
-- 后续种子按：
-  - 与已选种子最大相似度越低越好
-  - 同时保留少量质量权重偏置
-
-这个函数的目的不是求均值中心，而是为局部重聚类选 seed。
-
-### 6.2.5 `_select_weighted_medoid`
-
-功能：
-
-- 在一个簇内部，从真实样本中挑一个最具有代表性的样本作为 medoid
-
-实现逻辑：
-
-- 计算簇内所有 token 两两 cosine similarity
-- 再用 `weights` 加权求和
-- 得分最高者作为代表原型
-
-注意：
-
-- 当前原型在局部重聚类后，是 medoid 式代表点，不是均值中心
-- 这是当前实现与旧文档最关键的差异之一
-
-### 6.2.6 `QueryPrototypeBank` 的状态结构
-
-当前 `QueryPrototypeBank` 是按“类别 x slot”组织，而不是“层 x 类别”组织。
-
-当前 buffer 包括：
-
-| 名称 | 形状 | 作用 |
-| --- | --- | --- |
-| `prototype_bank` | `[num_classes, num_prototypes, C]` | 每类多个 prototype slot |
-| `prototype_count` | `[num_classes, num_prototypes]` | 每个 slot 的支持度 |
-| `prototype_quality` | `[num_classes, num_prototypes]` | 每个 slot 的质量 EMA |
-| `prototype_radius` | `[num_classes, num_prototypes]` | 每个 slot 的离散度 |
-| `prototype_age` | `[num_classes, num_prototypes]` | 每个 slot 距离上次更新的时间 |
-| `prototype_updates` | `[1]` | 全局更新次数 |
-| `bank_query_feats` | `[num_classes, query_bank_size, C]` | 当前 bank 中保留的 query exemplar |
-| `bank_query_support` | `[num_classes, query_bank_size]` | 每个 exemplar 代表的支持度 |
-| `bank_query_quality` | `[num_classes, query_bank_size]` | 每个 exemplar 的质量统计 |
-| `bank_query_score` | `[num_classes, query_bank_size]` | exemplar 的候选分数缓存 |
-| `bank_query_valid` | `[num_classes, query_bank_size]` | 当前 query bank 槽位有效位 |
-
-这里有几个必须说明的细节：
-
-- 当前 bank 不再按 decoder layer 单独维护。
-- 当前 bank 是类别级共享 bank。
-- 当前 `memory_size_per_class` 现在更接近“每类当前 query bank pool 的容量”。
-- 当前更推荐显式使用 `query_bank_size`；旧的 `recent_buffer_size` 现在只是兼容别名。
-- 当前 slot 的分布不是从“历史 recent buffer”里维护出来的，而是从“bank 里当前仍然存在的 query exemplar”重新刷出来的。
-
-### 6.2.7 `get_valid_mask`
-
-功能：
-
-- 用 `prototype_count >= min_count` 判断某个 slot 是否可以参与检索和匹配
-
-当前语义：
-
-- `min_count` 是 slot 支持度门槛
-- 不是旧文档里的 layer-class prototype 是否成熟的门槛
-
-### 6.2.8 `get_normalized_bank`
-
-功能：
-
-- 对整个 `prototype_bank` 做 `F.normalize`
-
-用途：
-
-- prototype 匹配
-- prototype retrieval
-- prototype loss
-
-### 6.2.9 `match_slots`
-
-功能：
-
-- 在计算 `loss_proto` 时，根据 GT 类别标签，给每个正样本 query 找到“同类中最相似的有效 slot”
-
-输入：
-
-- `feats`
-- `labels`
-- `min_count`
-
-输出：
-
-- `matched_bank`
-- `matched_mask`
-- `matched_slots`
-
-注意：
-
-- 这里不依赖预测类别分布
-- 它使用的是 GT label 指定类别，再在该类内部找最近 slot
-- 这是 loss 端的监督匹配，不是 refinement 端的 retrieval
-
-### 6.2.10 `update`
-
-功能：
-
-- 训练时用正样本 query 更新 bank
-
-步骤：
-
-1. 对 `feats`、`labels`、`qualities` 做 `detach`
-2. 用 `_all_gather_tensor` 聚合多卡数据
-3. 对 `feats` 做归一化
-4. 对每个出现的类别调用 `_update_class_query_bank`
-5. 对被触达的类别调用 `_refresh_class_slots`
-6. 增加 `prototype_updates`
-
-额外细节：
-
-- 每次更新前，所有已有 slot 的 `prototype_age` 会加一
-- 只有被当前 batch 触达的类别，才会进入 query bank 更新和 slot 重刷流程
-- `slot` 的最终形状始终来自该类当前 `bank_query_feats` 的整体分布，而不是来自额外的历史候选缓存
-
-### 6.2.11 `_quality_to_weight`
-
-功能：
-
-- 把 head 侧传进来的 `quality` 映射到 `[0.1, 1.0]` 左右的范围
-
-公式：
-
-- `0.1 + 0.9 * sigmoid(quality)`
-
-目的：
-
-- 避免质量过低时完全失去作用
-- 避免质量过高时过度放大
-
-### 6.2.12 `_update_class_query_bank`
-
-功能：
-
-- 对某个类别的一批正样本 query 逐个更新“当前 query bank 池”
-
-细节：
-
-- 样本先按 `qualities` 从高到低排序
-- 质量高的 query 先更新 bank
-
-这意味着：
-
-- 当前实现优先让高质量样本决定“哪些 query 进入当前 bank”
-
-### 6.2.13 `_update_query_bank_single`
-
-功能：
-
-- 用单个 query 更新对应类别的当前 query bank exemplar
-
-分支逻辑如下：
-
-1. 先计算该 query 的 `candidate_score`
-2. 如果 `candidate_score < query_score_threshold`，直接丢弃
-3. 如果该类当前一个 exemplar 都没有，直接 `_add_query_exemplar`
-4. 否则，计算它与该类所有有效 exemplar 的相似度
-5. 如果最佳相似度高于 `query_dedup_threshold` 或 `query_merge_threshold`，则 `_merge_query_exemplar`
-6. 如果 bank 还没满，且最佳相似度低于 `query_new_threshold`，则新开一个 exemplar
-7. 如果 bank 还没满但也不够新颖，则并入当前最相近 exemplar
-8. 如果 bank 已满，则调用 `_replace_query_exemplar`
-
-这就是当前代码的冷启动、增量扩容和满池替换策略。
-
-### 6.2.14 `_compute_candidate_score`
-
-功能：
-
-- 衡量一个新 query 是否值得进入当前 bank
-
-公式：
-
-- 如果该类当前还没有 exemplar，则 `novelty = 1.0`
-- 否则，先找与当前 bank 中最相近 exemplar 的最大相似度 `best_sim`
-- `novelty = 1.0 - best_sim`
-- `candidate_score = 0.5 * quality_weight + 0.5 * novelty`
-
-这部分的含义是：
-
-- query 必须同时兼顾质量和新颖性，才更容易进入 bank
-- 当前并不是“来一个正样本就一定记住”
-
-### 6.2.15 `_add_query_exemplar`
-
-功能：
-
-- 在该类还有空位时，往当前 query bank 里新增一个 exemplar
-
-写入内容：
-
-- `bank_query_feats = normalize(feat)`
-- `bank_query_support = 1.0`
-- `bank_query_quality = quality_weight`
-- `bank_query_score = candidate_score`
-- `bank_query_valid = True`
-
-这一部分直接保证了冷启动可用：
-
-- 即使训练一开始 bank 完全为空，也能被第一批高质量正样本逐步填充
-- 不需要额外 warmup hook，训练可以直接起跑
-
-### 6.2.16 `_merge_query_exemplar`
-
-功能：
-
-- 对已有 exemplar 做增量融合
-
-核心变量：
-
-- `old_feat`
-- `old_support`
-- `old_quality`
-
-步长 `alpha` 的来源：
-
-1. 先根据 `quality_weight` 在线性区间 `[alpha_min, alpha_max]` 内生成基础步长
-2. 再按 `1 / sqrt(support + 1)` 衰减
-3. 如果 exemplar 很新，则给一个更新下界：
-   - `support <= 1` 时，下界为 `alpha_min`
-   - `1 < support <= 4` 时，下界为 `max(1 - momentum, 0.01)`
-
-更新内容：
-
-- `bank_query_feats` 按 `alpha` 融合后重新归一化
-- `bank_query_support += 1`
-- `bank_query_quality` 用 `quality_gamma` 做 EMA
-- `bank_query_score` 用 `_compute_bank_query_score` 更新
-
-需要特别说明：
-
-- 当前 `momentum` 不再直接作为旧实现里 prototype EMA 的主系数
-- 它现在主要影响“新 exemplar 在早期阶段的最小更新下界”
-
-### 6.2.17 `_replace_query_exemplar`
-
-功能：
-
-- 当 query bank 已满时，决定是否用新 query 替换掉一个旧 exemplar
-
-步骤：
-
-1. 取出当前该类所有有效 exemplar
-2. 计算 exemplar 两两相似度，得到冗余度 `redundancy`
-3. 用 `support`、`quality`、`redundancy` 构造 utility
-4. 找到 utility 最低、最值得被替换的 exemplar
-5. 计算新 query 的 `candidate_utility`
-6. 如果新 query 既不比最差 exemplar 更值钱，且也没达到 `query_replace_threshold`，则放弃
-7. 否则直接用新 query 覆盖这个 exemplar，并把其 `support` 重置为 1
-
-这里的关键点是：
-
-- bank 满了以后，不是继续无限累积历史，而是维持一个固定容量的“当前代表池”
-- 替换时考虑了质量、代表性和冗余度，不是单纯按最新时间戳覆盖
-
-### 6.2.18 `_refresh_class_slots`
-
-功能：
-
-- 从该类当前仍然保存在 bank 中的所有 query exemplar，重新生成固定数量的 prototype slots
-
-输入 token 来源：
-
-- 只来自 `bank_query_feats`
-- 不再拼接旧 slot
-- 不再拼接 recent/history buffer
-
-每个 token 的权重构成：
-
-- `sqrt(support) * (0.5 + quality)`
-
-流程：
-
-1. 读取该类当前有效 `bank_query_feats / support / quality`
-2. 计算权重
-3. 用 `_select_weighted_diverse_indices` 选 seed
-4. 把所有当前 bank query 分配到最近 seed
-5. 每个簇内部用 `_select_weighted_medoid` 选代表 slot
-6. 统计每个簇的：
-   - `new_bank`
-   - `new_count`
-   - `new_quality`
-   - `new_radius`
-7. 清空该类旧 slot 状态并用新簇结果替换
-
-这里还需要说明几个关键点：
-
-- 当前是“按类固定簇数”的重刷，不是跨类别全局聚类
-- 当前 slot 的分布只依赖“bank 里现在还存在的 exemplar”
-- `prototype_count` 的语义是该簇聚合后的支持度总和
-- `prototype_radius` 是当前 bank exemplar 相对该 slot medoid 的加权离散度
-
-### 6.2.19 `PrototypeCrossAttention`
-
-这是当前 refinement 真正使用的模块。
-
-当前没有 `QueryDifficultyEstimator`，也没有 `PrototypeRefiner`，而是直接用 cross-attention 把 prototype token 注入 query。
-
-#### 输入
-
-- `query_feat`
-- `cls_score`
-- `prototype_bank`
+- `prototype_bank`: `[num_classes, num_prototypes, embed_dims]`
 - `prototype_count`
-- `min_count`
+- `prototype_quality`
+- `prototype_radius`
+- `prototype_age`
+- `prototype_updates`
 
-#### 过滤逻辑
+另外还有一套“每类当前 exemplar 池”:
 
-- 只有 `prototype_count >= min_count` 的 slot 才参与
-- 如果没有任何有效 slot，直接返回原始 `query_feat`
+- `bank_query_feats`
+- `bank_query_support`
+- `bank_query_quality`
+- `bank_query_score`
+- `bank_query_valid`
 
-#### prototype 选择逻辑
+当前更新路径可以概括为:
 
-当前 retrieval 采用的是“先选类别，再使用所选类别下的全部 slot”的方案。
+1. 收集正样本 query 的 `feat / label / quality`
+2. DDP 下先 `_all_gather_tensor`
+3. 对每个类别依次执行 exemplar 更新
+4. exemplar 更新内部按相似度和阈值决定 `add / merge / replace`
+5. 类内 exemplar 池更新完后，再刷新固定数量的 prototype slots
 
-具体逻辑是：
+其中 exemplar 维护的关键策略如下:
 
-1. 对 `cls_score` 做归一化 sigmoid，得到 `cls_prob`
-2. 用 `valid_slots.any(dim=-1)` 得到哪些类别至少有一个成熟 slot
-3. 把没有成熟 slot 的类别在 `cls_prob` 中直接 mask 掉
-4. 按类别概率选 top `topk_classes` 个类别
-5. 对这几个类别，不再做 slot 级打分
-6. 直接把这些类别下的全部 slot 展开成 prototype tokens
+- `query_score_threshold` 决定候选 query 是否值得进入池子
+- `query_dedup_threshold` 决定是否应视作重复样本并合并
+- `query_merge_threshold` 决定是否并入现有 exemplar
+- `query_new_threshold` 决定空位存在时是否应该新开 exemplar
+- `query_replace_threshold` 决定池子满时是否值得替换旧 exemplar
 
-因此当前 retrieval 的关键特点是：
+slot 刷新逻辑不是简单均值，而是:
 
-- 类别级选择使用 `cls_prob`
-- slot 级不再做额外排序
-- 所选类别下的所有 slot 都会进入 cross-attention
-- `prototype_count` 只用于判断 slot 是否成熟，不再参与 slot 分数计算
+- 先用 `_select_weighted_diverse_indices` 选出多样化种子
+- 再把当前 exemplar 分配到最近的种子
+- 每个簇里用 `_select_weighted_medoid` 选 medoid 作为 slot prototype
+- 同时统计 `count / quality / radius`
 
-#### attention 结构
+因此当前实现更接近:
 
-- `query_norm`
-- `memory_norm`
-- `q_proj`
-- `k_proj`
-- `v_proj`
-- `scaled_dot_product_attention`
-- `out_proj`
-- `ffn_norm`
-- `ffn`
+- “在线 exemplar 池 + 多样化簇刷新”
 
-#### 初始化方式
+而不是:
 
-- `out_proj` 全零初始化
-- `ffn` 最后一层全零初始化
+- “每次直接用正样本均值做 EMA”
 
-这意味着：
+#### 5.4.4 `match_slots`
 
-- 训练初期该模块更接近 identity
-- 有助于减少一开始 prototype 注入过强导致的训练不稳定
+这个方法负责训练时把正样本 query 和同类 prototype 对齐。
 
-#### 输出方式
+当前行为:
 
-- 只对 `query_has_proto` 的 query 做 refinement
-- 更新方式是 residual：
-  - `query + attn_out`
-  - 再加一层 FFN residual
+- 先按类别筛样本
+- 只在该类别内的有效 slot 里匹配
+- 用 cosine similarity 选最相近的 slot
 
-需要注意：
+这为 `loss_proto` 提供了“同类 query 对应哪一个 prototype slot”的映射。
 
-- 当前 retrieval 使用的是 `prototype_count`
-- 当前 retrieval 没有直接使用 `prototype_quality`
-- 当前 retrieval 没有直接使用 `prototype_radius`
-- 当前 retrieval 没有直接使用 `prototype_age`
+#### 5.4.5 `PrototypeCrossAttention`
 
-这些状态当前只服务于 bank 维护，不直接参与 attention 打分。
+这是当前 transformer 中真正执行 refinement 的模块。
 
-## 6.3 `SparseBEV/models/sparsebev_transformer.py`
+它的工作流程是:
 
-### 6.3.1 `SparseBEVTransformer.__init__`
+1. 根据 `cls_score` 选每个 query 的 top-k 类别
+2. 从这些类别中取出所有 prototype tokens
+3. 用 `prototype_count >= min_count` 作为有效性掩码
+4. 以 query 为 `q`，prototype tokens 为 `k/v` 做 `scaled_dot_product_attention`
+5. 经过 `out_proj`
+6. 再接一层残差 FFN
 
-相对初始提交新增：
+几个关键实现细节:
 
-- `proto_query` 参数
+- 只有“有可用 prototype token”的 query 才会被 refinement
+- 没有可用 prototype 的 query 会直接保留原特征
+- 训练冷启动阶段额外有 `_attach_ddp_zero_residual`，用来避免 DDP 报 unused parameter
 
-作用：
+从当前代码看，真正落地的是“prototype cross-attention 注入语义先验”，而不是“显式难度估计器驱动的门控 refinement”。
 
-- 把 prototype 配置传递给 decoder
+### 5.5 `SparseBEV/models/sparsebev_transformer.py`
 
-### 6.3.2 `SparseBEVTransformer.forward`
+这个文件的累计改动，核心就是把 `proto_query.py` 中的能力接进 decoder 主循环，同时尽量不碰原始 sampling 主干。
 
-相对初始提交新增输入：
+#### 5.5.1 构造函数改动
+
+`SparseBEVTransformer.__init__` 和 `SparseBEVTransformerDecoder.__init__` 都新增了:
+
+- `proto_query=None`
+
+decoder 初始化后会立即执行:
+
+- `self.configure_proto_query(proto_query)`
+
+#### 5.5.2 `configure_proto_query`
+
+这个新方法负责把配置转成 decoder 内部行为，主要做了几件事:
+
+- 解析 `enabled`
+- 解析 `refine_layers`
+- 生成 `self.proto_refine_layers`
+- 判断 `self.prototype_refine_enabled`
+- 在启用时构建 `PrototypeCrossAttention`
+
+当前主配置 `refine_layers=[0, 1, 2, 3, 4]`，而 decoder 一共 6 层，所以现在的行为是:
+
+- 第 0 到第 4 层输出后允许做 prototype refinement
+- 最后一层只输出最终结果，不再把 refinement 送到后继层
+
+#### 5.5.3 `forward` 输入输出扩展
+
+相对初始提交，transformer `forward` 多了下面这些输入:
 
 - `prototype_bank`
 - `prototype_count`
@@ -609,110 +319,53 @@
 - `dn_pad_size`
 - `return_query_feats`
 
-相对初始提交新增输出：
+输出从原来的:
 
+- `cls_scores`
+- `bbox_preds`
+
+变成了:
+
+- `cls_scores`
+- `bbox_preds`
 - `final_query_feats`
 
-注意：
+这里返回的是“最后一层 query feat”，不是“每一层 query feat 列表”。
 
-- 当前只返回最后一层的 query features
-- 不再返回所有 decoder 层的 query features
+#### 5.5.4 decoder 主循环中的新逻辑
 
-### 6.3.3 `SparseBEVTransformerDecoder.configure_proto_query`
+当前每层 decoder 的处理顺序变成:
 
-当前逻辑：
+1. 先执行原有 `decoder_layer`
+2. 拿到 `layer_query_feat / cls_score / bbox_pred`
+3. 如果当前层在 `proto_refine_layers` 中，则只对非 DN query 做 `PrototypeCrossAttention`
+4. refinement 后的 query_feat 再送去下一层
+5. `bbox_pred` 仍然照常 `detach` 后作为下一层参考框
 
-- 解析 `proto_query`
-- 读取 `enabled`
-- 读取 `refine_layers`
-- 如果没有 `refine_layers`，退回到 `use_layers`
-- 如果还没有，则默认取 `num_layers - 2`
+其中 DN query 的处理方式很明确:
 
-并对层号做约束：
+- 用 `dn_pad_size` 切分
+- 只对 `[:, dn_pad_size:]` 的正常 query 做 refinement
+- DN 前缀 `[:, :dn_pad_size]` 原样拼回
 
-- 只有 `0 <= layer_idx < num_layers - 1` 的层会被保留
+#### 5.5.5 明确未动的内容
 
-这意味着：
-
-- refinement 只发生在“某层输出后、下一层输入前”
-- 最后一层 decoder 之后没有后续层，因此不会作为 refinement 插点
-
-### 6.3.4 当前默认 refinement 层
-
-主配置和 quicktest 配置里都写的是：
-
-- `refine_layers = [0, 1, 2, 3, 4]`
-
-在 `num_layers = 6` 的情况下，全部有效。
-
-也就是说：
-
-- 当前默认会在前五层 decoder 输出后都做 refinement
-- 第六层只是输出最终预测，不会再做后处理式注入
-
-### 6.3.5 `prototype_cross_attention` 的构造参数
-
-来自配置或默认值的参数包括：
-
-- `num_prototypes`
-- `prototype_topk_classes`
-- `prototype_attn_heads`
-- `prototype_attn_drop`
-- `prototype_ffn_hidden_dim`
-
-其中当前配置里显式写出的只有：
-
-- `num_prototypes = 8`
-- `prototype_topk_classes = 2`
-- `prototype_attn_heads = 8`
-
-当前默认值但未在配置里显式写出的是：
-
-- `prototype_attn_drop = 0.1`
-- `prototype_ffn_hidden_dim = 512`
-
-需要注意：
-
-- 当前 retrieval 不再按 slot 打分截断
-- 当前真正生效的是 `prototype_topk_classes`
-- 每个被选中的类别会直接使用该类别下的全部 `num_prototypes` 个 slots
-
-### 6.3.6 decoder 主循环
-
-与初始提交相比，当前每层多了这些行为：
-
-1. 保留 `layer_query_feat`
-2. 如果 `return_query_feats=True`，则把最后一层 feature 存入 `final_query_feats`
-3. 如果当前层属于 `proto_refine_layers`：
-   - 去掉 DN 前缀，只保留正常 query
-   - 用 `PrototypeCrossAttention` 做 refinement
-   - 再把 DN query 和正常 query 拼回去
-4. 更新 `query_bbox = bbox_pred.detach()`
-
-注意：
-
-- DN query 不参与 prototype refinement
-- 这是通过 `dn_pad_size` 显式切掉前缀实现的
-
-### 6.3.7 未改动部分
-
-当前文件中下列部分与 prototype 无关，保持原始 SparseBEV 逻辑：
+当前 transformer 虽然接入了 prototype，但下面这些函数和链路没有被改:
 
 - `sampling_4d`
 - `make_sample_points`
-- `MSMV_CUDA`
-- time difference 计算
-- `lidar2img` 组织方式
-- image features 的预重排
-- decoder layer 本体内部结构
+- 多视角采样的 CUDA 封装调用
 
-## 6.4 `SparseBEV/models/sparsebev_head.py`
+所以这次改动并不是在 feature sampling 层面动刀，而是在 query feature 层面追加 prototype 先验。
 
-### 6.4.1 `__init__`
+### 5.6 `SparseBEV/models/sparsebev_head.py`
 
-相对初始提交新增：
+这是当前累计改动里业务逻辑最完整的一处，它承担了配置解析、bank 持有、loss 计算、bank 更新四项职责。
 
-- `proto_query` 参数
+#### 5.6.1 初始化阶段
+
+`__init__` 新增了 `proto_query=None` 参数，并解析出一整套内部字段:
+
 - `self.proto_enabled`
 - `self.proto_refine_layers`
 - `self.proto_num_prototypes`
@@ -722,469 +375,167 @@
 - `self.prototype_bank`
 - `self.proto_supervision_layer`
 
-其中：
+当 `proto_enabled=True` 时，还会:
 
-- `self.proto_supervision_layer = decoder.num_layers - 1`
+1. 调用 `self.transformer.decoder.configure_proto_query(...)`
+2. 读取 decoder 的 `proto_refine_layers`
+3. 把 `proto_supervision_layer` 设为 `decoder.num_layers - 1`
+4. 构建 `QueryPrototypeBank`
 
-这意味着当前 prototype loss 只用最后一层 supervision。
+这里有两个很关键的结论:
 
-### 6.4.2 `QueryPrototypeBank` 的构造参数
+- bank 实例由 head 持有，不是 transformer 持有
+- prototype loss 的监督层固定为最后一层
 
-当前 head 端显式支持下列 bank 超参：
+#### 5.6.2 `forward`
 
-| 参数 | 当前默认值 | 说明 |
-| --- | --- | --- |
-| `num_prototypes` | 8 | 每类 slot 数 |
-| `memory_size_per_class` | 100 | 每类当前 query bank pool 的默认容量 |
-| `bank_momentum` | 0.99 | 当前只间接影响早期更新下界 |
-| `query_bank_size` | `memory_size_per_class` | 每类当前 query bank 的容量 |
-| `query_merge_threshold` | 0.75 | 新 query 与已有 exemplar 多接近时直接合并 |
-| `query_new_threshold` | 0.55 | bank 未满时是否值得新开 exemplar |
-| `maintenance_interval` | 64 | 局部维护周期 |
-| `proto_alpha_min` | 0.05 | 在线更新最小步长基值 |
-| `proto_alpha_max` | 0.20 | 在线更新最大步长基值 |
-| `proto_quality_gamma` | 0.10 | slot 质量 EMA 系数 |
-| `proto_radius_gamma` | 0.10 | slot 半径 EMA 系数 |
-| `query_score_threshold` | 0.20 | query 进入当前 bank 的最低门槛 |
-| `query_dedup_threshold` | 0.95 | 与已有 exemplar 极其相近时直接去重合并 |
-| `query_replace_threshold` | 0.30 | 满池时新 query 至少要达到的替换强度 |
+当前 `forward` 新增了与 prototype 相关的准备逻辑:
 
-兼容性说明：
+- 从 `self.prototype_bank` 取 `prototype_bank`
+- 从 `self.prototype_bank` 取 `prototype_count`
+- 从 DN mask 里计算 `dn_pad_size`
+- 仅在 `self.training and self.proto_enabled` 时要求 transformer 返回 `final_query_feats`
 
-- 当前代码仍兼容旧 key：`recent_buffer_size`、`online_match_threshold`、`init_match_threshold`、`recent_score_threshold`、`recent_dedup_threshold`、`radius_refresh_threshold`
-- 但这些旧名字已经不再代表“history / recent buffer”语义，后续建议统一改用 `query_bank_*` 命名
+随后调用 transformer 时，显式传入:
 
-当前主配置并没有把这些扩展超参全部写出来，很多值仍然依赖默认值。
+- `prototype_bank`
+- `prototype_count`
+- `prototype_min_count`
+- `dn_pad_size`
+- `return_query_feats`
 
-### 6.4.3 `forward`
+如果存在 DN query，输出里还会把:
 
-相对初始提交，当前新增流程：
+- `all_cls_scores`
+- `all_bbox_preds`
+- `final_query_feats`
 
-1. 从 `self.prototype_bank` 中取出：
-   - `prototype_bank`
-   - `prototype_count`
-2. 计算 `dn_pad_size`
-3. 计算 `return_query_feats = self.training and self.proto_enabled`
-4. 调用 transformer 时，把 prototype 信息传进去
-5. 如果 transformer 返回了最后一层 `final_query_feats`，则把它写入 `outs`
+一起裁掉 DN 前缀，只把真实 query 部分放进 `outs`。
 
-注意：
+#### 5.6.3 target 信息增强
 
-- 推理阶段默认不回传 `final_query_feats`
-- 只有训练阶段并且启用 prototype 时才会返回
-
-### 6.4.4 DN 相关处理
-
-当前 `forward` 中：
-
-- DN query 仍然保留在 transformer 内部参与原始 DETR/DN 机制
-- 但在输出 `outs` 时，`final_query_feats` 会和分类、回归结果一起切掉 DN 前缀
-
-因此：
-
-- 后续 `loss_proto` 只基于正常 matching query 计算
-- 不会把 DN query 混入 prototype supervision
-
-### 6.4.5 `get_targets`
-
-相对初始提交新增返回：
+`get_targets` 的返回值相对初始提交新增了:
 
 - `pos_inds_list`
 - `neg_inds_list`
 
-原因：
+这一步是为了后面按正样本索引，从 `final_query_feats` 中抽取和 GT 匹配成功的 query。
 
-- 后续需要根据正样本索引，从最后一层 query features 中抽取正样本 query
+#### 5.6.4 损失函数重构
 
-### 6.4.6 `_loss_single_impl`
+原来的 `loss_single` 被拆成:
 
-相对初始提交的变化：
+- `_loss_single_impl(...)`
+- `loss_single(...)`
+- `loss_single_with_targets(...)`
 
-- 把原始 `loss_single` 拆成 `_loss_single_impl`
-- 增加 `return_targets` 开关
+这样做的目的不是改分类/回归损失本身，而是让 loss 计算时顺手把 target 对齐信息返回出来，供 prototype 分支复用。
 
-当 `return_targets=True` 时，会额外返回：
+#### 5.6.5 query quality 计算
 
-- `labels_list`
-- `bbox_targets_list`
-- `pos_inds_list`
+当前新增了 `compute_query_quality`。
 
-这给 prototype loss 复用了同一套匹配结果。
+quality 的定义来自两部分误差:
 
-### 6.4.7 `compute_query_quality`
+- GT 类别 logit 的 BCE 误差
+- bbox 预测相对 GT 的加权绝对误差
 
-当前实现新增了 query quality 估计，用于 bank 更新。
-
-质量来源由两部分误差构成：
-
-1. 分类误差
-2. bbox 误差
-
-分类误差：
-
-- 取 GT label 对应的 `gt_logits`
-- 用 `binary_cross_entropy_with_logits(gt_logits, 1)` 计算
-
-bbox 误差：
-
-- 对 GT bbox 做 `normalize_bbox`
-- 计算 `abs(pred - target)`
-- 再乘 `code_weights` 求均值
-
-最终质量：
+最终返回的是:
 
 - `-(cls_error + bbox_error)`
 
-这意味着：
+也就是说:
 
 - 分类越准、框越准，quality 越高
-- 这是当前在线 bank 更新的核心驱动信号
+- quality 之后会作为 bank 更新时的样本质量权重
 
-### 6.4.8 `collect_positive_queries`
+#### 5.6.6 正样本 query 收集
 
-功能：
+`collect_positive_queries` 做的事情很直接:
 
-- 根据 `pos_inds_list` 从每张图中收集：
-  - `pos_feats`
-  - `pos_labels`
-  - `pos_scores`
-  - `pos_bbox_preds`
-  - `pos_bbox_targets`
+- 根据 `pos_inds_list`
+- 从 `query_feats / cls_scores / bbox_preds / bbox_targets` 中抽正样本
+- 拼出 `pos_feats / pos_labels / pos_quality`
 
-然后调用 `compute_query_quality` 得到：
+这一步明确把 prototype 训练信号限定在“和 GT 成功匹配的正样本 query”上。
 
-- `pos_quality`
+#### 5.6.7 `loss_proto`
 
-### 6.4.9 `calc_prototype_loss`
+当前 `calc_prototype_loss` 的逻辑如下:
 
-当前实现中的 prototype loss 不是旧文档描述的“temperature CE 到类 prototype”，而是更简单的“同类最近 slot cosine 对齐损失”。
+1. 只在 `proto_enabled` 且 `prototype_bank` 存在时继续
+2. 从最后一层 query 中收集正样本
+3. 先生成一份 `bank_update=(pos_feats, pos_labels, pos_quality)`
+4. 若 `lambda_proto <= 0` 或没有正样本，则 loss 为 0，但 bank 仍然可以更新
+5. 调用 `self.prototype_bank.match_slots(...)` 找到同类可用 slot
+6. 对有匹配 slot 的样本，计算 cosine alignment loss:
+   - `loss_proto = 1 - cos(pos_feat, matched_bank_slot)`
 
-流程：
+当前 `loss_proto` 的本质不是分类损失或对比学习大框架，而是一个非常直接的同类 prototype 对齐项。
 
-1. 从最后一层 `final_query_feats` 中抽取正样本 query
-2. 生成 `bank_update = (feats, labels, qualities)`
-3. 如果 `proto_loss_weight <= 0` 或没有正样本，则直接返回零损失
-4. 调用 `prototype_bank.match_slots`
-5. 只保留匹配到有效 slot 的正样本
-6. 对 query 和 matched prototype 做归一化
-7. 计算：
+#### 5.6.8 在线 bank 更新
 
-```text
-loss_proto = 1 - cosine(query_feat, matched_slot_proto)
-```
+`update_prototype_bank` 在 `loss()` 里被调用，输入就是上一步得到的 `bank_update`。
 
-因此当前 `loss_proto` 的性质是：
+实际效果是:
 
-- 监督对象是“同类中最相似且已成熟的 slot”
-- 不是“所有类 prototype 上做分类式对比学习”
-- 不依赖 temperature 参数
-- 不需要显式负类 prototype
+- 每个训练 batch 结束时
+- 最后一层正样本 query 会在线刷新 class-wise prototype bank
 
-### 6.4.10 `update_prototype_bank`
+这让当前系统形成了一个闭环:
 
-功能：
+- forward 时使用历史 bank 做 refinement
+- loss 时用当前 batch 的正样本对齐 bank
+- 同时再用当前 batch 正样本回写 bank
 
-- 把 `bank_update` 中的：
-  - `feats`
-  - `labels`
-  - `qualities`
- 传给 `self.prototype_bank.update`
+#### 5.6.9 `loss()` 总体变化
 
-也就是说：
+当前 `loss()` 相比初始提交多了三件事:
 
-- 当前 bank 更新发生在 `loss` 内部
-- 是训练时在线更新
-- 更新使用的是正样本 query 的 GT label 和 quality
+1. 从 `preds_dicts` 读取 `final_query_feats`
+2. `multi_apply` 调用 `loss_single_with_targets`，拿到 `all_target_infos`
+3. 在最后一层上追加 `loss_proto` 和 `update_prototype_bank`
 
-### 6.4.11 `loss`
+但原始检测主损失仍然保留:
 
-相对初始提交新增内容：
+- `loss_cls`
+- `loss_bbox`
+- `d{i}.loss_cls`
+- `d{i}.loss_bbox`
+- DN loss
 
-1. 从 `preds_dicts` 中读取 `final_query_feats`
-2. 对所有 decoder 层调用 `loss_single_with_targets`
-3. 额外保存 `all_target_infos`
-4. 在最后一层上计算 `loss_proto`
-5. 如果启用 prototype，则把 `loss_proto` 写入 `loss_dict`
-6. 调用 `update_prototype_bank`
+因此当前 head 不是“改写原损失”，而是在原损失旁边追加了一条 prototype 分支。
 
-注意：
+## 6. 当前改动真正改变了什么
 
-- prototype loss 当前只对最后一层 decoder 生效
-- bank 更新也只使用最后一层正样本 query
+从运行行为上看，相对 `5910ed2`，当前代码新增了下面这些能力:
 
-## 6.5 `SparseBEV/configs/r50_nuimg_704x256.py`
+1. 训练时可以维护一个按类别组织、每类多个 slot 的 prototype bank
+2. decoder 中间层可以读取 prototype，并对正常 query 做 cross-attention refinement
+3. 最后一层正样本 query 可以通过 `loss_proto` 显式向同类 prototype 对齐
+4. 正样本 query 还能在线反哺 prototype bank，使 bank 随训练持续更新
+5. 提供了一份基于 mini sweep 标注的 quicktest 配置，方便快速验证逻辑
 
-### 6.5.1 新增 `proto_query_cfg`
+同时，当前代码没有新增下面这些方向的改动:
 
-当前主配置显式写出的参数是：
+1. 没有改任何采样点生成逻辑
+2. 没有改 CUDA `msmv_sampling` 实现
+3. 没有改 view / frame 选择策略
+4. 没有改数据增强或数据加载流程
+5. 没有改主训练脚本入口
 
-| 参数 | 当前值 |
-| --- | --- |
-| `enabled` | `True` |
-| `num_prototypes` | `8` |
-| `memory_size_per_class` | `100` |
-| `query_bank_size` | `100` |
-| `bank_momentum` | `0.99` |
-| `min_memory_count` | `8` |
-| `refine_layers` | `[0, 1, 2, 3, 4]` |
-| `lambda_proto` | `0.1` |
-| `prototype_cross_attn` | `True` |
-| `prototype_topk_classes` | `2` |
-| `prototype_attn_heads` | `8` |
-| `query_merge_threshold` | `0.75` |
-| `query_new_threshold` | `0.55` |
-| `query_score_threshold` | `0.20` |
-| `query_dedup_threshold` | `0.95` |
-| `query_replace_threshold` | `0.30` |
+## 7. 附录: 当前工作区相对 `HEAD` 的额外未提交状态
 
-### 6.5.2 接入位置
+虽然相对 `5910ed2` 的累计代码改动只有上面 6 个文件，但在本次检查开始时，当前工作区相对 `HEAD` 还存在下面这些未提交删除项:
 
-当前 `proto_query_cfg` 同时接入：
-
-- `SparseBEVHead`
-- `SparseBEVTransformer`
-
-### 6.5.3 与初始提交相比的其他变化
-
-主配置还额外调整了：
-
-- `MyTextLoggerHook.interval`：从 `1` 变成 `50`
-- `MyTensorboardLoggerHook.interval`：从 `500` 变成 `50`
-- `eval_config.interval`：从 `total_epochs` 变成 `1`
-
-其他训练和数据配置没有本质变化。
-
-## 6.6 `SparseBEV/configs/r50_nuimg_704x256-quicktest.py`
-
-这个文件在初始提交中不存在，是当前工作区新增的快速实验配置。
-
-与主配置相比，它的主要区别是：
-
-- 数据文件改成 mini 版本：
-  - `nuscenes_infos_train_mini_sweep.pkl`
-  - `nuscenes_infos_val_mini_sweep.pkl`
-  - `nuscenes_infos_test_mini_sweep.pkl`
-- `proto_query_cfg` 目前与主配置保持一致
-- 日志和评估频率更接近初始主配置：
-  - `MyTextLoggerHook.interval = 1`
-  - `MyTensorboardLoggerHook.interval = 500`
-  - `eval_config.interval = total_epochs`
-
-因此 quicktest 更适合快速确认功能是否能跑通，而不是频繁验证完整 val。
-
-## 6.7 `SparseBEV/configs/r50_nuimg_704x256-quick.py`
-
-这个文件只有一行：
-
-```python
-_base_ = ['./r50_nuimg_704x256-quicktest.py']
-```
-
-它本身没有独立配置项，只是给 quicktest 配置提供一个单独入口。
-
-## 7. 当前代码与旧文档的偏差
-
-当前仓库中有两份旧文档：
-
-- `SparseBEV/docs/proto_temporal_sparsebev_design.md`
 - `SparseBEV/docs/changes_vs_initial_branch.md`
+- `SparseBEV/docs/proto_temporal_sparsebev_design.md`
+- `Xue_CorrBEV_Multi-View_3D_Object_Detection_by_Correlation_Learning_with_Multi-modal_CVPR_2025_paper.pdf`
 
-这两份文档都不能再被当作“当前工作区真实实现”的准确描述。
+这些删除项不会出现在 `git diff 5910ed2...当前工作区` 中，原因是:
 
-### 7.1 与 `proto_temporal_sparsebev_design.md` 的偏差
+- 它们都是在 `5910ed2` 之后才被加入仓库的
+- 但当前工作区又把它们删掉了
+- 所以相对 `5910ed2` 来看，它们是“加入后又删掉”，最终净变化为 0
 
-| 文档中的描述 | 当前代码真实情况 | 影响 |
-| --- | --- | --- |
-| 按 decoder layer 维护 bank，形状是 `[L, num_classes, C]` | 当前 bank 是 `[num_classes, num_prototypes, C]` | 不再按层分离 prototype 空间 |
-| 存在 `QueryDifficultyEstimator` | 当前代码没有这个类 | 当前没有显式难度分数 |
-| 存在 `PrototypeRefiner` | 当前代码没有这个类 | 当前 refinement 由 cross-attention 完成 |
-| refinement 依赖 `cls_entropy / cls_margin / bbox_delta_norm / query_drift` | 当前代码没有使用这些信号 | 当前不再做 difficulty-aware gating |
-| 使用 `mix_query_prototypes` 生成 prototype 混合向量 | 当前代码没有这个函数 | 当前改为 slot-aware token retrieval |
-| prototype loss 是 temperature CE | 当前代码是 cosine alignment 到 matched slot | loss 形式发生变化 |
-| 收集所有 decoder 层 `all_query_feats` | 当前代码只用最后一层 `final_query_feats` | supervision 范围缩小 |
-| `min_proto_count` 保护类 prototype | 当前代码用 `min_memory_count` 保护 slot | 门槛语义变化 |
-
-### 7.2 与 `changes_vs_initial_branch.md` 的偏差
-
-这份文档的问题更明显，因为它描述的是更早阶段的一版本地实现。
-
-主要偏差包括：
-
-- 文档把比较基线写成了“`HEAD -> 当前工作区`”，而不是“`5910ed2 -> 当前工作区`”
-- 文档声称存在：
-  - `QueryDifficultyEstimator`
-  - `PrototypeRefiner`
-  - `mix_query_prototypes`
-- 文档声称当前实现是：
-  - 按 layer 维护 prototype
-  - 收集所有 decoder 层 query features
-  - prototype loss 使用 temperature CE
-- 这些都已经不是当前工作区代码的真实情况
-
-因此：
-
-- 旧变更文档只能作为“历史阶段说明”
-- 不能作为当前实现的行为说明书
-
-## 8. 当前真实流程的端到端描述
-
-为了便于后续继续改动，这里把当前 prototype 相关流程按执行顺序完整描述一次。
-
-### 8.1 模型构建阶段
-
-1. 配置文件定义 `proto_query_cfg`
-2. `SparseBEVHead` 读取配置
-3. `SparseBEVHead` 调用 `decoder.configure_proto_query`
-4. `SparseBEVHead` 创建 `QueryPrototypeBank`
-5. `SparseBEVTransformerDecoder` 创建 `PrototypeCrossAttention`
-
-### 8.2 训练前向阶段
-
-1. head 初始化 query bbox 与 query feat
-2. head 根据 GT 构建 DN query
-3. head 从 bank 中读取：
-   - `prototype_bank`
-   - `prototype_count`
-4. head 调用 transformer
-5. decoder 每层先执行原始 SparseBEV block
-6. 指定层把正常 query 拿出来
-7. `PrototypeCrossAttention` 先按类别选 top-k 类，再取这些类别下的全部 slot token
-8. refinement 后的 query 送入下一层
-9. 最后一层 query feature 作为 `final_query_feats` 返回给 head
-
-### 8.3 loss 计算阶段
-
-1. head 先算原始分类与回归损失
-2. head 保留最后一层的 target 信息
-3. head 从最后一层 `final_query_feats` 中抽取正样本
-4. head 计算正样本 quality
-5. head 用 GT label 在同类 slot 中找最近 prototype
-6. head 计算 `loss_proto`
-7. head 把正样本 `(feat, label, quality)` 传给 bank
-
-### 8.4 bank 更新阶段
-
-1. bank 收到多卡聚合后的正样本
-2. 每个类别按 quality 从高到低处理
-3. 对每个 query：
-   - 若类内没有 exemplar，则新建
-   - 若 bank 未满且与已有 exemplar 差异足够大，则新建
-   - 否则并入最近 exemplar，或者在满池时替换代表性差的 exemplar
-4. 处理完该类当前 batch 后，从当前 `bank_query_feats` 重新刷新固定数量的 slots
-
-## 9. 明确未改动的部分
-
-尽管当前工作区增加了 prototype 机制，但以下部分与初始提交保持同一路线，没有被 prototype 改造：
-
-- `SparseBEV/models/sparsebev_sampling.py`
-- `SparseBEV/models/csrc/*`
-- `sampling_4d`
-- `make_sample_points`
-- 数据集实现
-- 数据增强管线
-- 相机视角选择逻辑
-- frame-level 或 view-level 采样权重
-
-换句话说，当前所有 prototype 改动都发生在：
-
-- decoder 层间的 query feature 空间
-- head 的 supervision 与 bank update 侧
-
-## 10. 需要特别注意的实现细节
-
-下面这些点在后续继续修改时最容易误判，单独列出来。
-
-### 10.1 `memory_size_per_class` 的语义已经变化
-
-旧版本和旧文档里，它对应“class memory”的容量。
-
-当前代码里：
-
-- 它现在更接近“每类当前 query bank 的容量”
-- 如果显式写了 `query_bank_size`，优先使用 `query_bank_size`
-- 旧的 `recent_buffer_size` 还兼容，但只是旧名字别名
-
-因此如果后面要继续加 memory 机制，不要误以为当前仍然存在一个独立的 historical recent buffer。
-
-### 10.2 `momentum` 的语义已经变化
-
-旧版本和旧文档里，它是 prototype EMA 的核心系数。
-
-当前代码里：
-
-- 它不再直接参与“`new = m * old + (1 - m) * current_mean`”这种更新
-- 它只在新 slot 早期阶段，用来生成一个最小更新下界
-
-如果后面想恢复显式 EMA 语义，需要重新设计这部分。
-
-### 10.3 当前 retrieval 没有直接使用 quality、radius、age
-
-虽然 bank 中维护了：
-
-- `prototype_quality`
-- `prototype_radius`
-- `prototype_age`
-
-但当前 `PrototypeCrossAttention` 只使用：
-
-- `prototype_bank`
-- `prototype_count`
-
-因此：
-
-- 这些额外状态目前只服务于 bank 维护
-- 还没有进入 retrieval scoring
-
-另外还要注意：
-
-- 当前 retrieval 也不再做 slot 级打分
-- 它只按类别概率选 top-k 类，再直接展开这些类别下的全部成熟 slots
-
-### 10.4 当前 `loss_proto` 只使用最后一层
-
-当前不是多层 prototype supervision。
-
-当前只有：
-
-- 最后一层 query features
-- 最后一层分类与回归输出
-- 最后一层匹配结果
-
-参与 `loss_proto` 和 bank update。
-
-### 10.5 当前 refinement 层是 `[0, 1, 2, 3, 4]`
-
-因为 decoder 一共有 6 层，所以：
-
-- 第 0 到第 4 层输出后都做 refinement
-- 第 5 层只输出最终结果
-
-如果后面修改 `refine_layers`，需要记住最后一层不会被保留为 refinement 插点。
-
-## 11. 验证情况
-
-本次梳理对应的当前工作区代码，已经做过以下基础检查：
-
-- `python3 -m py_compile SparseBEV/models/proto_query.py`
-- `python3 -m py_compile SparseBEV/models/sparsebev_transformer.py`
-- `python3 -m py_compile SparseBEV/models/sparsebev_head.py`
-- `python3 -m py_compile SparseBEV/configs/r50_nuimg_704x256.py`
-- `python3 -m py_compile SparseBEV/configs/r50_nuimg_704x256-quicktest.py`
-- `python3 -m py_compile SparseBEV/configs/r50_nuimg_704x256-quick.py`
-
-这些语法检查通过，说明当前修改至少在 Python 语法层面是可解析的。
-
-但是：
-
-- 当前没有在这个终端里完成完整训练或评测
-- 当前没有在这份文档中给出 NDS、mAP 或 loss 曲线结论
-
-因此本文档描述的是“当前真实代码结构”，不是“已经被实验完全验证的结论”。
-
-## 12. 最终结论
-
-如果只用一句话概括当前工作区相对初始提交的真实变化，可以写成：
-
-当前工作区把原始 SparseBEV 扩展成了一套“类别级多 prototype slot 的在线 bank + 局部维护 + query-conditioned prototype cross-attention + 最后一层 prototype cosine alignment loss”的系统，而仓库中的旧文档仍然停留在更早期的“按层单 prototype + difficulty-aware refinement”描述上。
-
-后续如果继续修改 prototype 机制，应优先以当前代码为准，而不是以旧文档为准。
+如果后续还要继续维护这套对比文档，建议把“相对基线提交的累计差异”和“相对当前 `HEAD` 的未提交工作区状态”继续分开记录，这样最不容易混淆。

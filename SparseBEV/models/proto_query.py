@@ -129,6 +129,8 @@ class QueryPrototypeBank(nn.Module):
         self.register_buffer('prototype_radius', torch.zeros(num_classes, num_prototypes))
         self.register_buffer('prototype_age', torch.zeros(num_classes, num_prototypes))
         self.register_buffer('prototype_updates', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('prototype_dirty', torch.zeros(num_classes, dtype=torch.bool))
+        self.register_buffer('prototype_dirty_count', torch.zeros(num_classes, dtype=torch.long))
 
         # Per-class current query pool. Slots are refreshed from these tokens instead
         # of from a historical recent buffer.
@@ -210,15 +212,21 @@ class QueryPrototypeBank(nn.Module):
             if not torch.any(cls_mask):
                 continue
 
-            touched_classes.append(cls_idx)
-            self._update_class_query_bank(
+            dirty_score = self._update_class_query_bank(
                 cls_idx,
                 feats[cls_mask],
                 qualities[cls_mask],
             )
+            if dirty_score <= 0:
+                continue
+
+            touched_classes.append(cls_idx)
+            self.prototype_dirty[cls_idx] = True
+            self.prototype_dirty_count[cls_idx] += dirty_score
 
         for cls_idx in touched_classes:
-            self._refresh_class_slots(cls_idx)
+            if self._should_refresh_class_slots(cls_idx):
+                self._refresh_class_slots(cls_idx)
 
         self.prototype_updates += 1
 
@@ -228,11 +236,29 @@ class QueryPrototypeBank(nn.Module):
 
     @torch.no_grad()
     def _update_class_query_bank(self, cls_idx, feats, qualities):
+        dirty_merge = False
+        dirty_add = False
+        dirty_replace = False
         order = qualities.argsort(descending=True)
         for sample_idx in order.tolist():
             feat = feats[sample_idx]
             quality_weight = self._quality_to_weight(qualities[sample_idx]).to(feat.dtype)
-            self._update_query_bank_single(cls_idx, feat, quality_weight)
+            update_code = self._update_query_bank_single(cls_idx, feat, quality_weight)
+            if update_code == 1:
+                dirty_merge = True
+            elif update_code == 2:
+                dirty_add = True
+            elif update_code == 3:
+                dirty_replace = True
+
+        dirty_score = 0
+        if dirty_merge:
+            dirty_score += 1
+        if dirty_add:
+            dirty_score += 2
+        if dirty_replace:
+            dirty_score += 3
+        return dirty_score
 
     @torch.no_grad()
     def _update_query_bank_single(self, cls_idx, feat, quality_weight):
@@ -240,11 +266,10 @@ class QueryPrototypeBank(nn.Module):
         valid_inds = torch.nonzero(valid_mask, as_tuple=False).flatten()
         candidate_score = self._compute_candidate_score(cls_idx, feat, quality_weight)
         if candidate_score.item() < self.query_score_threshold:
-            return
+            return 0
 
         if valid_inds.numel() == 0:
-            self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
-            return
+            return 2 if self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score) else 0
 
         exemplars = F.normalize(self.bank_query_feats[cls_idx, valid_inds], dim=-1, eps=1e-6)
         similarity = torch.matmul(exemplars, feat)
@@ -254,21 +279,20 @@ class QueryPrototypeBank(nn.Module):
 
         if best_sim >= self.query_dedup_threshold:
             self._merge_query_exemplar(cls_idx, best_idx, feat, quality_weight)
-            return
+            return 1
 
         if best_sim >= self.query_merge_threshold:
             self._merge_query_exemplar(cls_idx, best_idx, feat, quality_weight)
-            return
+            return 1
 
         if valid_inds.numel() < self.query_bank_size and best_sim < self.query_new_threshold:
-            self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
-            return
+            return 2 if self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score) else 0
 
         if valid_inds.numel() < self.query_bank_size:
             self._merge_query_exemplar(cls_idx, best_idx, feat, quality_weight)
-            return
+            return 1
 
-        self._replace_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
+        return 3 if self._replace_query_exemplar(cls_idx, feat, quality_weight, candidate_score) else 0
 
     def _compute_candidate_score(self, cls_idx, feat, quality_weight):
         valid_mask = self.bank_query_valid[cls_idx]
@@ -282,6 +306,61 @@ class QueryPrototypeBank(nn.Module):
 
     def _compute_bank_query_score(self, support, quality):
         return torch.sqrt(support.clamp(min=1.0)) * (0.5 + quality)
+
+    def _compute_slot_utility(self, counts, qualities, radii):
+        if counts.numel() == 0:
+            return counts
+        count_score = torch.sqrt(counts.clamp(min=1.0))
+        count_score = count_score / count_score.max().clamp(min=1e-6)
+        quality_score = qualities.clamp(min=0.0, max=1.0)
+        radius_score = 1.0 - radii.clamp(min=0.0, max=1.0)
+        return 0.50 * count_score + 0.30 * quality_score + 0.20 * radius_score
+
+    def _should_refresh_class_slots(self, cls_idx):
+        if not bool(self.prototype_dirty[cls_idx].item()):
+            return False
+
+        num_query_tokens = int(self.bank_query_valid[cls_idx].sum().item())
+        if num_query_tokens <= 0:
+            return False
+
+        valid_slot_mask = self.prototype_count[cls_idx] > 0
+        num_valid_slots = int(valid_slot_mask.sum().item())
+        target_slots = min(self.num_prototypes, num_query_tokens)
+        dirty_count = int(self.prototype_dirty_count[cls_idx].item())
+
+        if num_valid_slots == 0:
+            return True
+
+        fill_interval = max(1, self.maintenance_interval // 8)
+        if num_valid_slots < target_slots and dirty_count >= fill_interval:
+            return True
+
+        if dirty_count >= self.maintenance_interval:
+            return True
+
+        if torch.any(valid_slot_mask):
+            max_age = float(self.prototype_age[cls_idx][valid_slot_mask].max().item())
+            if dirty_count > 0 and max_age >= float(self.maintenance_interval):
+                return True
+
+        return False
+
+    def _slot_blend(self, old_count, new_count):
+        if old_count.numel() == 0:
+            return old_count
+        blend = new_count / (old_count + new_count).clamp(min=1.0)
+        return blend.clamp(min=0.15, max=0.60)
+
+    @torch.no_grad()
+    def _clear_class_slots(self, cls_idx):
+        self.prototype_bank[cls_idx].zero_()
+        self.prototype_count[cls_idx].zero_()
+        self.prototype_quality[cls_idx].zero_()
+        self.prototype_radius[cls_idx].zero_()
+        self.prototype_age[cls_idx].zero_()
+        self.prototype_dirty[cls_idx] = False
+        self.prototype_dirty_count[cls_idx] = 0
 
     @torch.no_grad()
     def _add_query_exemplar(self, cls_idx, feat, quality_weight, candidate_score):
@@ -331,8 +410,7 @@ class QueryPrototypeBank(nn.Module):
         valid_mask = self.bank_query_valid[cls_idx]
         valid_inds = torch.nonzero(valid_mask, as_tuple=False).flatten()
         if valid_inds.numel() == 0:
-            self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
-            return
+            return self._add_query_exemplar(cls_idx, feat, quality_weight, candidate_score)
 
         existing_feats = F.normalize(self.bank_query_feats[cls_idx, valid_inds], dim=-1, eps=1e-6)
         existing_support = self.bank_query_support[cls_idx, valid_inds]
@@ -354,7 +432,7 @@ class QueryPrototypeBank(nn.Module):
         candidate_utility = 0.5 * quality_weight + 0.5 * (1.0 - best_sim)
         if (candidate_utility.item() < utility[replace_local].item()
                 and candidate_utility.item() < self.query_replace_threshold):
-            return
+            return False
 
         replace_idx = int(valid_inds[replace_local].item())
         self.bank_query_feats[cls_idx, replace_idx] = F.normalize(feat, dim=0, eps=1e-6)
@@ -362,6 +440,7 @@ class QueryPrototypeBank(nn.Module):
         self.bank_query_quality[cls_idx, replace_idx] = quality_weight
         self.bank_query_score[cls_idx, replace_idx] = candidate_score
         self.bank_query_valid[cls_idx, replace_idx] = True
+        return True
 
     @torch.no_grad()
     def _refresh_class_slots(self, cls_idx):
@@ -371,30 +450,96 @@ class QueryPrototypeBank(nn.Module):
         query_quality = self.bank_query_quality[cls_idx][query_mask].clamp(min=0.05)
 
         if query_feats.numel() == 0:
-            self.prototype_bank[cls_idx].zero_()
-            self.prototype_count[cls_idx].zero_()
-            self.prototype_quality[cls_idx].zero_()
-            self.prototype_radius[cls_idx].zero_()
-            self.prototype_age[cls_idx].zero_()
+            self._clear_class_slots(cls_idx)
             return
 
-        tokens = query_feats
+        tokens = F.normalize(query_feats, dim=-1, eps=1e-6)
         support = query_support
         quality = query_quality
         weights = torch.sqrt(support.clamp(min=1.0)) * (0.5 + quality)
 
-        num_slots = min(self.num_prototypes, tokens.shape[0])
-        seed_inds = _select_weighted_diverse_indices(tokens, weights, num_slots)
-        seed_tokens = tokens[seed_inds]
-        assign_ids = torch.matmul(tokens, seed_tokens.transpose(0, 1)).argmax(dim=-1)
+        old_bank = self.prototype_bank[cls_idx].clone()
+        old_count = self.prototype_count[cls_idx].clone()
+        old_quality = self.prototype_quality[cls_idx].clone()
+        old_radius = self.prototype_radius[cls_idx].clone()
+        old_age = self.prototype_age[cls_idx].clone()
+
+        valid_slot_inds = torch.nonzero(old_count > 0, as_tuple=False).flatten()
+        target_slots = min(self.num_prototypes, tokens.shape[0])
+
+        seed_slot_inds = []
+        seed_tokens = []
+        if valid_slot_inds.numel() > 0:
+            slot_utility = self._compute_slot_utility(
+                old_count[valid_slot_inds],
+                old_quality[valid_slot_inds],
+                old_radius[valid_slot_inds],
+            )
+            num_keep = min(target_slots, valid_slot_inds.numel())
+            if valid_slot_inds.numel() > num_keep:
+                keep_local = slot_utility.topk(num_keep).indices
+                valid_slot_inds = valid_slot_inds[keep_local]
+            base_seed_tokens = F.normalize(old_bank[valid_slot_inds], dim=-1, eps=1e-6)
+            seed_slot_inds.append(valid_slot_inds)
+            seed_tokens.append(base_seed_tokens)
+
+        if len(seed_tokens) > 0:
+            current_seed_tokens = torch.cat(seed_tokens, dim=0)
+            cover_similarity = torch.matmul(tokens, current_seed_tokens.transpose(0, 1)).max(dim=-1).values
+        else:
+            cover_similarity = tokens.new_full((tokens.shape[0],), -1.0)
+
+        empty_slot_inds = torch.nonzero(old_count <= 0, as_tuple=False).flatten()
+        num_missing_slots = max(0, target_slots - (0 if len(seed_slot_inds) == 0 else int(torch.cat(seed_slot_inds).numel())))
+        if num_missing_slots > 0 and empty_slot_inds.numel() > 0:
+            novel_mask = cover_similarity < self.query_new_threshold
+            if torch.any(novel_mask):
+                novel_tokens = tokens[novel_mask]
+                novel_weights = weights[novel_mask]
+                num_new_slots = min(num_missing_slots, empty_slot_inds.numel(), novel_tokens.shape[0])
+                selected = _select_weighted_diverse_indices(novel_tokens, novel_weights, num_new_slots)
+                seed_slot_inds.append(empty_slot_inds[:num_new_slots])
+                seed_tokens.append(novel_tokens[selected])
+
+        if len(seed_tokens) == 0:
+            seed_inds = _select_weighted_diverse_indices(tokens, weights, target_slots)
+            seed_slot_inds = [torch.arange(seed_inds.numel(), device=tokens.device, dtype=torch.long)]
+            seed_tokens = [tokens[seed_inds]]
+        else:
+            existing_seed_slots = torch.cat(seed_slot_inds, dim=0)
+            existing_seed_tokens = torch.cat(seed_tokens, dim=0)
+            if (existing_seed_slots.numel() == target_slots
+                    and target_slots == self.num_prototypes
+                    and torch.all(old_count[existing_seed_slots] > 0)):
+                novel_mask = cover_similarity < self.query_new_threshold
+                if torch.any(novel_mask):
+                    novel_tokens = tokens[novel_mask]
+                    novel_weights = weights[novel_mask] * (1.0 - cover_similarity[novel_mask]).clamp(min=0.05)
+                    replace_candidate = int(novel_weights.argmax().item())
+                    slot_utility = self._compute_slot_utility(
+                        old_count[existing_seed_slots],
+                        old_quality[existing_seed_slots],
+                        old_radius[existing_seed_slots],
+                    )
+                    replace_local = int(slot_utility.argmin().item())
+                    candidate_gain = novel_weights[replace_candidate]
+                    if candidate_gain.item() > slot_utility[replace_local].item():
+                        existing_seed_tokens[replace_local] = novel_tokens[replace_candidate]
+                    seed_slot_inds = [existing_seed_slots]
+                    seed_tokens = [existing_seed_tokens]
+
+        slot_inds = torch.cat(seed_slot_inds, dim=0)
+        slot_seeds = F.normalize(torch.cat(seed_tokens, dim=0), dim=-1, eps=1e-6)
+        assign_ids = torch.matmul(tokens, slot_seeds.transpose(0, 1)).argmax(dim=-1)
 
         new_bank = tokens.new_zeros((self.num_prototypes, self.embed_dims))
         new_count = support.new_zeros((self.num_prototypes,))
         new_quality = quality.new_zeros((self.num_prototypes,))
         new_radius = quality.new_zeros((self.num_prototypes,))
+        new_age = old_age.clone()
 
-        for slot_idx in range(num_slots):
-            slot_mask = assign_ids == slot_idx
+        for local_idx, slot_idx in enumerate(slot_inds.tolist()):
+            slot_mask = assign_ids == local_idx
             if not torch.any(slot_mask):
                 continue
 
@@ -405,27 +550,51 @@ class QueryPrototypeBank(nn.Module):
 
             medoid_idx = _select_weighted_medoid(slot_tokens, slot_weights)
             slot_proto = F.normalize(slot_tokens[medoid_idx], dim=0, eps=1e-6)
+            slot_count = slot_support.sum()
+            slot_quality = (
+                (slot_quality_token * slot_weights).sum() / slot_weights.sum().clamp(min=1e-6)
+            )
             slot_radius = 1.0 - torch.matmul(slot_tokens, slot_proto).clamp(min=-1.0, max=1.0)
             slot_radius = (slot_radius * slot_weights).sum() / slot_weights.sum().clamp(min=1e-6)
 
-            new_bank[slot_idx] = slot_proto
-            new_count[slot_idx] = slot_support.sum()
-            new_quality[slot_idx] = (
-                (slot_quality_token * slot_weights).sum() / slot_weights.sum().clamp(min=1e-6)
-            )
-            new_radius[slot_idx] = slot_radius
+            if old_count[slot_idx] > 0:
+                blend = self._slot_blend(old_count[slot_idx:slot_idx + 1], slot_count[None])[0]
+                updated_proto = old_bank[slot_idx] * (1.0 - blend) + slot_proto * blend
+                updated_proto = F.normalize(updated_proto, dim=0, eps=1e-6)
+                updated_quality = old_quality[slot_idx] * (1.0 - blend) + slot_quality * blend
+                updated_radius = old_radius[slot_idx] * (1.0 - blend) + slot_radius * blend
+            else:
+                updated_proto = slot_proto
+                updated_quality = slot_quality
+                updated_radius = slot_radius
 
-        self.prototype_bank[cls_idx].zero_()
-        self.prototype_count[cls_idx].zero_()
-        self.prototype_quality[cls_idx].zero_()
-        self.prototype_radius[cls_idx].zero_()
-        self.prototype_age[cls_idx].zero_()
+            new_bank[slot_idx] = updated_proto
+            new_count[slot_idx] = slot_support.sum()
+            new_quality[slot_idx] = updated_quality
+            new_radius[slot_idx] = updated_radius
+            new_age[slot_idx] = 0.0
+
+        stale_mask = (old_count > 0) & (new_count <= 0)
+        if torch.any(stale_mask):
+            stale_inds = torch.nonzero(stale_mask, as_tuple=False).flatten()
+            stale_decay = 0.5
+            decayed_count = old_count[stale_inds] * stale_decay
+            keep_mask = decayed_count >= 1.0
+            if torch.any(keep_mask):
+                keep_inds = stale_inds[keep_mask]
+                new_bank[keep_inds] = F.normalize(old_bank[keep_inds], dim=-1, eps=1e-6)
+                new_count[keep_inds] = decayed_count[keep_mask]
+                new_quality[keep_inds] = old_quality[keep_inds] * (1.0 - self.quality_gamma)
+                new_radius[keep_inds] = old_radius[keep_inds]
+                new_age[keep_inds] = old_age[keep_inds]
 
         self.prototype_bank[cls_idx] = new_bank
         self.prototype_count[cls_idx] = new_count
         self.prototype_quality[cls_idx] = new_quality
         self.prototype_radius[cls_idx] = new_radius
-        self.prototype_age[cls_idx].zero_()
+        self.prototype_age[cls_idx] = new_age
+        self.prototype_dirty[cls_idx] = False
+        self.prototype_dirty_count[cls_idx] = 0
 
 
 class PrototypeCrossAttention(nn.Module):
