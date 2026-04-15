@@ -185,21 +185,18 @@ class SparseBEVTransformerDecoder(BaseModule):
                 match_query_feat = layer_query_feat[:, dn_pad_size:]
                 match_cls_score = cls_score[:, dn_pad_size:]
 
-                if match_query_feat.shape[1] > 0:
-                    refined_match_query_feat = self.prototype_cross_attention(
-                        match_query_feat,
-                        match_cls_score,
-                        prototype_bank,
-                        prototype_count,
-                        min_count=prototype_min_count,
-                    )
+                refined_match_query_feat = self.prototype_cross_attention(
+                    match_query_feat,
+                    match_cls_score,
+                    prototype_bank,
+                    prototype_count,
+                    min_count=prototype_min_count,
+                )
 
-                    if dn_pad_size > 0:
-                        query_feat = torch.cat([layer_query_feat[:, :dn_pad_size], refined_match_query_feat], dim=1)
-                    else:
-                        query_feat = refined_match_query_feat
+                if dn_pad_size > 0:
+                    query_feat = torch.cat([layer_query_feat[:, :dn_pad_size], refined_match_query_feat], dim=1)
                 else:
-                    query_feat = layer_query_feat
+                    query_feat = refined_match_query_feat
             else:
                 query_feat = layer_query_feat
 

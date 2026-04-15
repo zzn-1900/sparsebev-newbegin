@@ -466,14 +466,30 @@ class PrototypeCrossAttention(nn.Module):
         nn.init.zeros_(self.ffn[-1].weight)
         nn.init.zeros_(self.ffn[-1].bias)
 
+    def _attach_ddp_zero_residual(self, query_feat):
+        if query_feat is None or not self.training:
+            return query_feat
+
+        # Keep this module in the autograd graph even when the current batch has
+        # no usable prototype tokens on a given rank. This avoids DDP unused
+        # parameter errors during the bank cold-start stage.
+        zero = query_feat.new_zeros(())
+        for param in self.parameters():
+            zero = zero + param.sum() * 0.0
+        return query_feat + zero
+
     def forward(self,
                 query_feat,
                 cls_score,
                 prototype_bank,
                 prototype_count,
                 min_count=0):
-        if (prototype_bank is None or prototype_count is None or query_feat is None
-                or query_feat.numel() == 0):
+        if query_feat is None:
+            return query_feat
+
+        query_feat = self._attach_ddp_zero_residual(query_feat)
+
+        if prototype_bank is None or prototype_count is None or query_feat.numel() == 0:
             return query_feat
 
         valid_slots = prototype_count >= float(min_count)
