@@ -261,11 +261,17 @@ class SparseBEVSampling(BaseModule):
 
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
         self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
+        self.dist_embed = nn.Sequential(
+            nn.Linear(1, embed_dims),
+            nn.ReLU(inplace=True),
+        )
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+        nn.init.zeros_(self.dist_embed[0].weight)
+        nn.init.zeros_(self.dist_embed[0].bias)
 
     def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         '''
@@ -294,10 +300,21 @@ class SparseBEVSampling(BaseModule):
             sampling_points[..., 2:3]
         ], dim=-1)
 
-        # scale weights
-        scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
+        # compute per-frame BEV distance of warped query center
+        query_center_xy = decode_bbox(query_bbox, self.pc_range)[..., :2]  # [B, Q, 2]
+        vel_xy = query_bbox[..., 8:].detach()  # [B, Q, 2]
+        time_diff_f = img_metas[0]['time_diff']  # [B, F]
+        warped_center = query_center_xy[:, :, None, :] - vel_xy[:, :, None, :] * time_diff_f[:, None, :, None]  # [B, Q, F, 2]
+        frame_bev_dist = torch.norm(warped_center, dim=-1, keepdim=True)  # [B, Q, F, 1]
+        frame_bev_dist = frame_bev_dist / (self.pc_range[3] - self.pc_range[0])  # normalize
+
+        # distance-aware scale weights
+        dist_feat = self.dist_embed(frame_bev_dist)  # [B, Q, F, C]
+        fused_feat = query_feat[:, :, None, :] + dist_feat  # [B, Q, F, C]
+        scale_weights = self.scale_weights(fused_feat)  # [B, Q, F, G*P*L]
+        scale_weights = scale_weights.view(B, Q, self.num_frames, self.num_groups, self.num_points, self.num_levels)
+        scale_weights = scale_weights.permute(0, 1, 3, 2, 4, 5)  # [B, Q, G, F, P, L]
         scale_weights = torch.softmax(scale_weights, dim=-1)
-        scale_weights = scale_weights.expand(B, Q, self.num_groups, self.num_frames, self.num_points, self.num_levels)
 
         # sampling
         sampled_feats = sampling_4d(
