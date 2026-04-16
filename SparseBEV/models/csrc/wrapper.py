@@ -85,6 +85,10 @@ class MSMVSamplingC23456(torch.autograd.Function):
 
 
 def msmv_sampling(mlvl_feats, sampling_locations, scale_weights):
+    mlvl_feats = [feat.contiguous() for feat in mlvl_feats]
+    sampling_locations = sampling_locations.contiguous()
+    scale_weights = scale_weights.contiguous()
+
     if len(mlvl_feats) == 4 and MSMV_CUDA:
         return MSMVSamplingC2345.apply(*mlvl_feats, sampling_locations, scale_weights)
     elif len(mlvl_feats) == 5 and MSMV_CUDA:
