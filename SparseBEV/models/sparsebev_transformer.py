@@ -15,7 +15,8 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None,
+                 use_dprg=False, gate_rank=16):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +24,8 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range,
+                                                   use_dprg=use_dprg, gate_rank=gate_rank)
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +41,16 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None,
+                 use_dprg=False, gate_rank=16):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range,
+            use_dprg=use_dprg, gate_rank=gate_rank,
         )
 
     @torch.no_grad()
@@ -102,7 +106,8 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None,
+                 use_dprg=False, gate_rank=16):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -111,7 +116,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         self.pc_range = pc_range
 
         self.position_encoder = nn.Sequential(
-            nn.Linear(3, self.embed_dims), 
+            nn.Linear(3, self.embed_dims),
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims, self.embed_dims),
@@ -121,7 +126,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128,
+                                     use_dprg=use_dprg, num_frames=num_frames, num_points_per_frame=num_points, gate_rank=gate_rank)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -318,8 +324,9 @@ class SparseBEVSampling(BaseModule):
 
 
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    """Adaptive Mixing with optional Dual-Path Reliability Gating (DPRG)"""
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
+                 use_dprg=False, num_frames=8, num_points_per_frame=4, gate_rank=16):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -344,6 +351,19 @@ class AdaptiveMixing(nn.Module):
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
+        # DPRG: inserted between channel mixing and point mixing
+        self.use_dprg = use_dprg
+        if use_dprg:
+            from .dual_path_gating import DualPathReliabilityGating
+            self.dprg = DualPathReliabilityGating(
+                embed_dim=self.eff_in_dim,
+                query_dim=self.query_dim,   # full 256-dim query for Path Q
+                num_frames=num_frames,
+                num_points_per_frame=num_points_per_frame,
+                gate_rank=gate_rank,
+                current_frame_idx=0,
+            )
+
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
@@ -367,6 +387,15 @@ class AdaptiveMixing(nn.Module):
         out = torch.matmul(out, M)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
+
+        '''dual-path reliability gating (between channel mixing and point mixing)'''
+        if self.use_dprg:
+            # Broadcast full query (256-dim) to every group
+            query_full = query.unsqueeze(2).expand(B, Q, G, self.query_dim)
+            query_full = query_full.reshape(B * Q * G, self.query_dim)      # (B*Q*G, 256)
+            out_flat = out.reshape(B * Q * G, P, C)                         # (B*Q*G, P, 64)
+            out_flat = self.dprg(out_flat, query_full)                       # (B*Q*G, P, 64)
+            out = out_flat.reshape(B * Q, G, P, C)
 
         '''adaptive point mixing'''
         out = torch.matmul(S, out)  # implicitly transpose and matmul
