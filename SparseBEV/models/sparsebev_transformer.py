@@ -235,14 +235,19 @@ class SparseBEVSelfAttention(BaseModule):
 
     @torch.no_grad()
     def calc_bbox_dists(self, bboxes):
-        centers = decode_bbox(bboxes, self.pc_range)[..., :2]  # [B, Q, 2]
+        # Size-Normalized SASA: distance is measured in units of (s_i + s_j),
+        # where s = sqrt(w*l) is the BEV-plane box radius.
+        decoded = decode_bbox(bboxes, self.pc_range)
+        centers = decoded[..., :2]  # [B, Q, 2]
+        wl = decoded[..., 3:5]  # [B, Q, 2]
 
-        dist = []
-        for b in range(centers.shape[0]):
-            dist_b = torch.norm(centers[b].reshape(-1, 1, 2) - centers[b].reshape(1, -1, 2), dim=-1)
-            dist.append(dist_b[None, ...])
+        diff = centers[:, :, None, :] - centers[:, None, :, :]  # [B, Q, Q, 2]
+        dist = torch.norm(diff, dim=-1)  # [B, Q, Q]
 
-        dist = torch.cat(dist, dim=0)  # [B, Q, Q]
+        size = torch.sqrt(wl[..., 0] * wl[..., 1]).clamp(min=0.1)  # [B, Q]
+        size_sum = size[:, :, None] + size[:, None, :]  # [B, Q, Q]
+
+        dist = dist / (size_sum + 1e-5)
         dist = -dist
 
         return dist
