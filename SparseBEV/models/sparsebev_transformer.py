@@ -121,6 +121,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.gating = HistoricalFrameGating(embed_dims=embed_dims, num_groups=4, num_frames=num_frames)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -147,6 +148,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
     def init_weights(self):
         self.self_attn.init_weights()
         self.sampling.init_weights()
+        self.gating.init_weights()
         self.mixing.init_weights()
 
         bias_init = bias_init_with_prob(0.01)
@@ -168,6 +170,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
         sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat = self.gating(sampled_feat, query_feat, img_metas)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -315,6 +318,94 @@ class SparseBEVSampling(BaseModule):
             return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
         else:
             return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
+
+
+class HistoricalFrameGating(BaseModule):
+    """Reliability gating for historical frames.
+
+    Scores each historical frame (t >= 1) against the current frame (t = 0, anchor)
+    and the query feature, and produces a per-group per-frame weight in [0, 1] that
+    scales the sampled features before AdaptiveMixing. The current frame keeps
+    weight 1, so historical frames can never exceed it. Uncertainty is modeled via
+    a per-(group, frame) log-variance head that subtracts from the reliability logit
+    (precision weighting in a sigmoid form).
+
+    Input : sampled_feat [B, Q, G, T*P, C_g], query_feat [B, Q, embed_dims]
+    Output: gated sampled_feat with the same shape.
+    """
+    def __init__(self, embed_dims=256, num_groups=4, num_frames=8, d_q=64, init_bias=3.0, init_cfg=None):
+        super().__init__(init_cfg)
+        self.embed_dims = embed_dims
+        self.num_groups = num_groups
+        self.num_frames = num_frames
+        self.c_g = embed_dims // num_groups
+        self.d_q = d_q
+        self.init_bias = init_bias
+
+        self.q_proj = nn.Linear(embed_dims, d_q)
+        self.q_ln = nn.LayerNorm(d_q)
+        self.h_proj = nn.Linear(self.c_g, d_q)
+        self.h_ln = nn.LayerNorm(d_q)
+
+        # MLP input per historical frame: [h'_t, h'_t - a'_0, g_t, cos_t, dt]
+        # dims:                            D_q + D_q + D_q + 1 + 1 = 3*D_q + 2
+        self.score_mlp = nn.Sequential(
+            nn.Linear(3 * d_q + 2, d_q),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_q, 2),  # [logit, log_var]
+        )
+
+    @torch.no_grad()
+    def init_weights(self):
+        # identity-at-init: last layer zero => logit=log_var=0 => w ~= sigmoid(init_bias)
+        nn.init.zeros_(self.score_mlp[-1].weight)
+        nn.init.zeros_(self.score_mlp[-1].bias)
+
+    def forward(self, sampled_feat, query_feat, img_metas):
+        B, Q, G, TP, C_g = sampled_feat.shape
+        T = self.num_frames
+        if T <= 1:
+            return sampled_feat
+        P = TP // T
+
+        # [B, Q, G, T, P, C_g]
+        x = sampled_feat.view(B, Q, G, T, P, C_g)
+
+        # per-frame per-group pooled summary, projected to D_q with LN
+        h = x.mean(dim=4)                    # [B, Q, G, T, C_g]
+        h = self.h_ln(self.h_proj(h))        # [B, Q, G, T, D_q]
+
+        # query reference in the same D_q space (shared across G)
+        q_ref = self.q_ln(self.q_proj(query_feat))     # [B, Q, D_q]
+        q_ref_bcast = q_ref[:, :, None, None, :]       # [B, Q, 1, 1, D_q]
+
+        a0 = h[:, :, :, 0:1, :]              # [B, Q, G, 1, D_q] current-frame anchor
+        h_hist = h[:, :, :, 1:, :]           # [B, Q, G, T-1, D_q] historical frames
+
+        # intra-source subtraction (same projection) = frame drift signal
+        diff = h_hist - a0                                      # [B, Q, G, T-1, D_q]
+        # cross-source interactions (distribution-robust)
+        gate = h_hist * q_ref_bcast                             # [B, Q, G, T-1, D_q]
+        h_norm = F.normalize(h_hist, dim=-1, eps=1e-6)
+        q_norm = F.normalize(q_ref, dim=-1, eps=1e-6)
+        cos_t = (h_norm * q_norm[:, :, None, None, :]).sum(dim=-1, keepdim=True)  # [B, Q, G, T-1, 1]
+
+        # time-diff prior, [B, T] -> [B, Q, G, T-1, 1]
+        time_diff = img_metas[0]['time_diff']
+        dt = time_diff[:, None, None, 1:, None].expand(B, Q, G, T - 1, 1)
+
+        feat = torch.cat([h_hist, diff, gate, cos_t, dt], dim=-1)  # [B, Q, G, T-1, 3D_q+2]
+        score = self.score_mlp(feat)                                # [B, Q, G, T-1, 2]
+        logit = score[..., 0]
+        log_var = score[..., 1]
+
+        # bounded reliability: sigmoid ensures w_hist in (0, 1), strictly <= w_cur = 1
+        w_hist = torch.sigmoid(logit - log_var + self.init_bias)    # [B, Q, G, T-1]
+        w_cur = torch.ones_like(w_hist[..., :1])                    # [B, Q, G, 1]
+        w = torch.cat([w_cur, w_hist], dim=-1)                      # [B, Q, G, T]
+
+        x = x * w[..., None, None]                                  # broadcast to (P, C_g)
+        return x.reshape(B, Q, G, TP, C_g)
 
 
 class AdaptiveMixing(nn.Module):

@@ -207,7 +207,7 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3
 )
-total_epochs = 24
+total_epochs = 5
 batch_size = 8
 
 # load pretrained weights
@@ -230,7 +230,7 @@ log_config = dict(
 )
 
 # evaluation
-eval_config = dict(interval=1)
+eval_config = dict(interval=5)
 
 # other flags
 debug = False
