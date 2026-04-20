@@ -321,16 +321,23 @@ class SparseBEVSampling(BaseModule):
 
 
 class GroupTemporalRefine(BaseModule):
-    """Query-conditioned self-attention over (group, frame) tokens.
+    """Per-(group, frame) self-attention refinement with scalar heteroscedastic gate.
 
-    The QKV projection is conditioned on query_feat via the identity
-        W_qkv @ [g_tok ; q_proj] = W_qkv_g @ g_tok + W_qkv_q @ q_proj
-    which is implemented as two linears whose outputs are broadcast-added —
-    mathematically equivalent to concat-then-project but avoids materialising
-    a [B, Q, G*T, 2*C_g] intermediate. Attention is computed with SDPA (flash
-    backend). Identity-at-init via zero output projection.
+    Only Q is conditioned on query_feat; K and V are projected from the
+    (group, frame) tokens without any query conditioning. Self-attention
+    runs over G*T tokens so every (g, t) exchanges context with every
+    other (g', t'). An FFN with post-norm residuals follows, yielding a
+    C_g feature h_{g,t} per (group, frame). A linear head emits two
+    scalars per (g, t) — mean μ_{g,t} and log-variance log σ²_{g,t} —
+    whose combination
+        scale_{g,t} = μ_{g,t} · exp(-0.5 · log σ²_{g,t})
+    is a scalar gate shared across the C_g channels of that (g, t). The
+    residual h_{g,t} · scale_{g,t} is broadcast over P and added to the
+    original sampled features. Zero-initialised gate head gives identity
+    at init.
     """
-    def __init__(self, embed_dims=256, num_groups=4, num_frames=8, num_heads=4, init_cfg=None):
+    def __init__(self, embed_dims=256, num_groups=4, num_frames=8,
+                 num_heads=4, ffn_ratio=2, init_cfg=None):
         super().__init__(init_cfg)
         self.num_groups = num_groups
         self.num_frames = num_frames
@@ -339,20 +346,39 @@ class GroupTemporalRefine(BaseModule):
         assert self.c_g % num_heads == 0
         self.head_dim = self.c_g // num_heads
 
-        # QKV: g_tokens path + query-conditioned path. Summed via broadcast.
-        self.qkv_g = nn.Linear(self.c_g, 3 * self.c_g, bias=True)
-        self.qkv_q = nn.Linear(embed_dims, 3 * self.c_g, bias=False)
-        self.out_proj = nn.Linear(self.c_g, self.c_g)
+        # Q: token content + query-conditioned bias (broadcast over G*T).
+        self.q_proj_g = nn.Linear(self.c_g, self.c_g, bias=True)
+        self.q_proj_query = nn.Linear(embed_dims, self.c_g, bias=False)
+        # K, V: unconditioned projection of (group, frame) tokens.
+        self.kv_proj = nn.Linear(self.c_g, 2 * self.c_g, bias=True)
+        self.attn_out = nn.Linear(self.c_g, self.c_g)
 
         self.pe_group = nn.Parameter(torch.zeros(num_groups, self.c_g))
         self.pe_frame = nn.Parameter(torch.zeros(num_frames, self.c_g))
+
+        self.norm1 = nn.LayerNorm(self.c_g)
+        self.norm2 = nn.LayerNorm(self.c_g)
+
+        ffn_dim = self.c_g * ffn_ratio
+        self.ffn = nn.Sequential(
+            nn.Linear(self.c_g, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, self.c_g),
+        )
+
+        # Per-(group, frame) scalar (mean, log_var) gate — 2 values shared
+        # across that (g, t)'s C_g channels.
+        self.gate_head = nn.Linear(self.c_g, 2)
+        # Clamp range for log_var to keep exp(-0.5·log_var) numerically sane.
+        self.log_var_clamp = (-10.0, 10.0)
 
     @torch.no_grad()
     def init_weights(self):
         nn.init.trunc_normal_(self.pe_group, std=0.02)
         nn.init.trunc_normal_(self.pe_frame, std=0.02)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        # Zero-init the gate so μ=log_var=0 at init → scale=0 → refine=0.
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.zeros_(self.gate_head.bias)
 
     def inner_forward(self, sampled_feat, query_feat):
         B, Q, G, TP, C_g = sampled_feat.shape
@@ -363,31 +389,46 @@ class GroupTemporalRefine(BaseModule):
 
         x = sampled_feat.view(B, Q, G, T, P, C_g)
 
-        # per-(g, t) token via mean-pool over P, plus learnable (group, frame) PE.
-        g_tokens = x.mean(dim=4)                                           # [B, Q, G, T, C_g]
+        # (group, frame) tokens via mean-pool over P, plus learnable PE.
+        gt = x.mean(dim=4)                                                 # [B, Q, G, T, C_g]
         pe = self.pe_group[:, None, :] + self.pe_frame[None, :, :]         # [G, T, C_g]
-        g_tokens = g_tokens + pe
+        gt = gt + pe
 
-        # Flatten (B, Q) and (G, T) for maximum SDPA parallelism.
         BQ = B * Q
         N = G * T
-        tokens = g_tokens.reshape(BQ, N, C_g)
+        H, D = self.num_heads, self.head_dim
+        gt_flat = gt.reshape(BQ, N, C_g)                                   # [BQ, G*T, C_g]
 
-        # Query conditions the QKV projection: same value broadcast across GT,
-        # different values across the 3*C_g output (so Q, K, V all see query).
-        qkv = self.qkv_g(tokens)                                           # [BQ, N, 3*C_g]
-        q_bias = self.qkv_q(query_feat).reshape(BQ, 1, 3 * C_g)            # [BQ, 1, 3*C_g]
-        qkv = qkv + q_bias                                                  # broadcast add (no materialised concat)
+        # Q: per-(g,t) content + query bias (broadcast over G*T).
+        # K, V: pure token projection, no query conditioning.
+        q = self.q_proj_g(gt_flat) + self.q_proj_query(query_feat).reshape(BQ, 1, C_g)
+        kv = self.kv_proj(gt_flat)
+        k, v = kv.split(C_g, dim=-1)
 
-        qkv = qkv.view(BQ, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)                                   # [3, BQ, H, N, D]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = q.view(BQ, N, H, D).transpose(1, 2)                            # [BQ, H, G*T, D]
+        k = k.view(BQ, N, H, D).transpose(1, 2)
+        v = v.view(BQ, N, H, D).transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(q, k, v)                      # flash backend when available
+        out = F.scaled_dot_product_attention(q, k, v)                      # [BQ, H, G*T, D]
         out = out.transpose(1, 2).reshape(BQ, N, C_g)
-        refine = self.out_proj(out).view(B, Q, G, T, C_g)
+        out = self.attn_out(out)
 
-        x = x + refine.unsqueeze(4)
+        # Residual + LN around attn, then FFN with residual + LN (post-norm).
+        h = self.norm1(gt_flat + out)
+        h = self.norm2(h + self.ffn(h))
+
+        # Per-(g, t) (mean, log_var) shared across C_g — 2 scalars per (g,t).
+        gate = self.gate_head(h).view(B, Q, G, T, 2)                       # [B, Q, G, T, 2]
+        mean_s, log_var_s = gate.unbind(dim=-1)                            # [B, Q, G, T] each
+        log_var_s = log_var_s.clamp(*self.log_var_clamp)
+        # Scalar precision-weighted gate: uncertain (g,t) cells get shrunk.
+        scale = mean_s * torch.exp(-0.5 * log_var_s)                       # [B, Q, G, T]
+
+        h = h.view(B, Q, G, T, C_g)
+        refine = h * scale.unsqueeze(-1)                                   # [B, Q, G, T, C_g]
+
+        # Broadcast refinement over P only (each (g,t) has its own gate).
+        x = x + refine.unsqueeze(4)                                        # [B,Q,G,T,1,C_g]
         return x.reshape(B, Q, G, TP, C_g)
 
     def forward(self, sampled_feat, query_feat):
