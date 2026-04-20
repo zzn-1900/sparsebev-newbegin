@@ -323,11 +323,12 @@ class SparseBEVSampling(BaseModule):
 class GroupTemporalRefine(BaseModule):
     """Query-conditioned self-attention over (group, frame) tokens.
 
-    Pool P to get G*T tokens per query, apply FiLM modulation from query_feat
-    (query-conditioned feature shift), add learnable (group, frame) PE, run SA
-    via SDPA (FlashAttention backend when available), and residually refine the
-    per-point features. Identity-at-init via zero FiLM and zero output
-    projection.
+    The QKV projection is conditioned on query_feat via the identity
+        W_qkv @ [g_tok ; q_proj] = W_qkv_g @ g_tok + W_qkv_q @ q_proj
+    which is implemented as two linears whose outputs are broadcast-added —
+    mathematically equivalent to concat-then-project but avoids materialising
+    a [B, Q, G*T, 2*C_g] intermediate. Attention is computed with SDPA (flash
+    backend). Identity-at-init via zero output projection.
     """
     def __init__(self, embed_dims=256, num_groups=4, num_frames=8, num_heads=4, init_cfg=None):
         super().__init__(init_cfg)
@@ -338,8 +339,9 @@ class GroupTemporalRefine(BaseModule):
         assert self.c_g % num_heads == 0
         self.head_dim = self.c_g // num_heads
 
-        self.q_film = nn.Linear(embed_dims, 2 * self.c_g)
-        self.qkv = nn.Linear(self.c_g, 3 * self.c_g, bias=True)
+        # QKV: g_tokens path + query-conditioned path. Summed via broadcast.
+        self.qkv_g = nn.Linear(self.c_g, 3 * self.c_g, bias=True)
+        self.qkv_q = nn.Linear(embed_dims, 3 * self.c_g, bias=False)
         self.out_proj = nn.Linear(self.c_g, self.c_g)
 
         self.pe_group = nn.Parameter(torch.zeros(num_groups, self.c_g))
@@ -349,8 +351,6 @@ class GroupTemporalRefine(BaseModule):
     def init_weights(self):
         nn.init.trunc_normal_(self.pe_group, std=0.02)
         nn.init.trunc_normal_(self.pe_frame, std=0.02)
-        nn.init.zeros_(self.q_film.weight)
-        nn.init.zeros_(self.q_film.bias)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -363,28 +363,27 @@ class GroupTemporalRefine(BaseModule):
 
         x = sampled_feat.view(B, Q, G, T, P, C_g)
 
-        # per-(g, t) token via mean-pool over P
+        # per-(g, t) token via mean-pool over P, plus learnable (group, frame) PE.
         g_tokens = x.mean(dim=4)                                           # [B, Q, G, T, C_g]
-
-        # FiLM: query-conditioned scale/shift (zero-init => identity at start).
-        # Single linear over query_feat, broadcast across (G, T) — fully parallel.
-        scale, shift = self.q_film(query_feat).chunk(2, dim=-1)            # each [B, Q, C_g]
-        scale = scale[:, :, None, None, :]
-        shift = shift[:, :, None, None, :]
-
-        # Additive PE built once, broadcast addition fused with FiLM bias.
         pe = self.pe_group[:, None, :] + self.pe_frame[None, :, :]         # [G, T, C_g]
-        g_tokens = g_tokens * (1.0 + scale) + (shift + pe)                  # [B, Q, G, T, C_g]
+        g_tokens = g_tokens + pe
 
-        # Collapse (B, Q) and (G, T) for maximum SA parallelism.
+        # Flatten (B, Q) and (G, T) for maximum SDPA parallelism.
         BQ = B * Q
         N = G * T
         tokens = g_tokens.reshape(BQ, N, C_g)
-        qkv = self.qkv(tokens).view(BQ, N, 3, self.num_heads, self.head_dim)
+
+        # Query conditions the QKV projection: same value broadcast across GT,
+        # different values across the 3*C_g output (so Q, K, V all see query).
+        qkv = self.qkv_g(tokens)                                           # [BQ, N, 3*C_g]
+        q_bias = self.qkv_q(query_feat).reshape(BQ, 1, 3 * C_g)            # [BQ, 1, 3*C_g]
+        qkv = qkv + q_bias                                                  # broadcast add (no materialised concat)
+
+        qkv = qkv.view(BQ, N, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)                                   # [3, BQ, H, N, D]
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        out = F.scaled_dot_product_attention(q, k, v)                      # [BQ, H, N, D]
+        out = F.scaled_dot_product_attention(q, k, v)                      # flash backend when available
         out = out.transpose(1, 2).reshape(BQ, N, C_g)
         refine = self.out_proj(out).view(B, Q, G, T, C_g)
 
