@@ -262,10 +262,23 @@ class SparseBEVSampling(BaseModule):
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
         self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
 
+        # structural prior: G groups along evenly-divided height, P=4 BEV corners per group
+        assert num_points == 4, 'corner prior requires num_points=4'
+        corners_xy = torch.tensor([
+            [+0.5, +0.5],
+            [-0.5, +0.5],
+            [-0.5, -0.5],
+            [+0.5, -0.5],
+        ])  # [P=4, 2]
+        z_levels = (torch.arange(num_groups).float() + 0.5) / num_groups - 0.5  # [G]
+        template = torch.zeros(num_groups, num_points, 3)
+        template[..., 0:2] = corners_xy[None]
+        template[..., 2] = z_levels[:, None]
+        self.register_buffer('sampling_template', template)  # [G, P, 3]
+
     def init_weights(self):
-        bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
-        nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+        nn.init.zeros_(self.sampling_offset.bias)
 
     def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         '''
@@ -275,8 +288,10 @@ class SparseBEVSampling(BaseModule):
         B, Q = query_bbox.shape[:2]
         image_h, image_w, _ = img_metas[0]['img_shape'][0]
 
-        # sampling offset of all frames
+        # sampling offset of all frames: residual over structural prior (corners x height layers)
         sampling_offset = self.sampling_offset(query_feat)
+        sampling_offset = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
+        sampling_offset = sampling_offset + self.sampling_template
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
         sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
