@@ -15,7 +15,7 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None, use_bimamba_temporal=False):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +23,9 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(
+            embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size,
+            pc_range=pc_range, use_bimamba_temporal=use_bimamba_temporal)
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +41,15 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None, use_bimamba_temporal=False):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range,
+            use_bimamba_temporal=use_bimamba_temporal
         )
 
     @torch.no_grad()
@@ -102,7 +105,7 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None, use_bimamba_temporal=False):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -121,7 +124,9 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(
+            in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128,
+            use_bimamba_temporal=use_bimamba_temporal, num_frames=num_frames)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -168,7 +173,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
         sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, time_diff=img_metas[0]['time_diff']))
         query_feat = self.norm3(self.ffn(query_feat))
 
         cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
@@ -319,7 +324,8 @@ class SparseBEVSampling(BaseModule):
 
 class AdaptiveMixing(nn.Module):
     """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
+                 use_bimamba_temporal=False, num_frames=8):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -344,15 +350,36 @@ class AdaptiveMixing(nn.Module):
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
+        self.use_bimamba_temporal = use_bimamba_temporal
+        self.num_frames = num_frames
+        if use_bimamba_temporal:
+            assert in_points % num_frames == 0, \
+                f"in_points ({in_points}) must be divisible by num_frames ({num_frames})"
+            from .bimamba_temporal import TemporalBiMamba
+            self.temporal_mamba = TemporalBiMamba(d_model=self.eff_in_dim)
+
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
 
-    def inner_forward(self, x, query):
+    def inner_forward(self, x, query, time_diff=None):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
+
+        if self.use_bimamba_temporal:
+            assert time_diff is not None, "time_diff is required when use_bimamba_temporal=True"
+            T = self.num_frames
+            Pf = P // T
+            # sampling_4d flattens (T, Pf) with T outer: index k -> t = k // Pf, s = k % Pf
+            x_t = x.view(B, Q, G, T, Pf, C)
+            # reorder so T is the sequence axis, then flatten batch dims
+            x_t = x_t.permute(0, 1, 2, 4, 3, 5).contiguous()        # [B, Q, G, Pf, T, C]
+            x_seq = x_t.view(B * Q * G * Pf, T, C)
+            x_seq = self.temporal_mamba(x_seq, time_diff, (B, Q, G, Pf))
+            x_t = x_seq.view(B, Q, G, Pf, T, C).permute(0, 1, 2, 4, 3, 5).contiguous()
+            x = x_t.view(B, Q, G, P, C)
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
@@ -380,8 +407,8 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def forward(self, x, query):
+    def forward(self, x, query, time_diff=None):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, use_reentrant=False)
+            return cp(self.inner_forward, x, query, time_diff, use_reentrant=False)
         else:
-            return self.inner_forward(x, query)
+            return self.inner_forward(x, query, time_diff)
