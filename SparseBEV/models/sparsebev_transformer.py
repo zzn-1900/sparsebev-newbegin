@@ -408,7 +408,10 @@ class AdaptiveMixing(nn.Module):
         return out
 
     def forward(self, x, query, time_diff=None):
-        if self.training and x.requires_grad:
+        # Activation checkpoint is incompatible with Mamba: its custom autograd
+        # Function saves nn.Parameter leaves, which under non-reentrant cp
+        # trigger "No grad accumulator for a saved leaf" at backward time.
+        if self.training and x.requires_grad and not self.use_bimamba_temporal:
             return cp(self.inner_forward, x, query, time_diff, use_reentrant=False)
         else:
             return self.inner_forward(x, query, time_diff)
