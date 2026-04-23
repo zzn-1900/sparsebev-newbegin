@@ -408,10 +408,14 @@ class AdaptiveMixing(nn.Module):
         return out
 
     def forward(self, x, query, time_diff=None):
-        # Activation checkpoint is incompatible with Mamba: its custom autograd
-        # Function saves nn.Parameter leaves, which under non-reentrant cp
-        # trigger "No grad accumulator for a saved leaf" at backward time.
-        if self.training and x.requires_grad and not self.use_bimamba_temporal:
-            return cp(self.inner_forward, x, query, time_diff, use_reentrant=False)
+        if self.training and x.requires_grad:
+            # Mamba's custom autograd Function saves nn.Parameter leaves; under
+            # non-reentrant cp the saved_tensors_hooks clear their grad
+            # accumulators and backward fails with "No grad accumulator for a
+            # saved leaf". Reentrant cp runs the first forward under no_grad
+            # (Mamba saves nothing) and re-runs in backward with grad enabled
+            # (fresh ctx, live Parameters) — works correctly.
+            use_reentrant = self.use_bimamba_temporal
+            return cp(self.inner_forward, x, query, time_diff, use_reentrant=use_reentrant)
         else:
             return self.inner_forward(x, query, time_diff)
