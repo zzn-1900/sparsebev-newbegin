@@ -90,13 +90,14 @@ class TemporalBiMamba(nn.Module):
         dt = dt.view(B, 1, 1, 1, T, C).expand(B, Q, G, P, T, C).reshape(N, T, C)
 
         residual = x
-        y = self.norm(x + dt.to(x.dtype))
+        y = self.norm(x + dt.to(x.dtype)).contiguous()
 
-        with torch.cuda.amp.autocast(enabled=False):
-            y_fp = y.float().contiguous()
-            out_fwd = self.fwd(y_fp)
-            out_bwd = self.bwd(torch.flip(y_fp, dims=[1]).contiguous())
-            out_bwd = torch.flip(out_bwd, dims=[1])
-            out = out_fwd + out_bwd
+        # Run Mamba in the ambient AMP dtype (fp16 under mmcv's Fp16OptimizerHook).
+        # Mamba-ssm's CUDA kernels handle fp16/bf16 natively on sm_80+; forcing
+        # fp32 here was doubling activation memory for no real benefit.
+        out_fwd = self.fwd(y)
+        out_bwd = self.bwd(torch.flip(y, dims=[1]).contiguous())
+        out_bwd = torch.flip(out_bwd, dims=[1])
+        out = out_fwd + out_bwd
 
-        return residual + torch.tanh(self.gate) * out.to(x.dtype)
+        return residual + torch.tanh(self.gate) * out
