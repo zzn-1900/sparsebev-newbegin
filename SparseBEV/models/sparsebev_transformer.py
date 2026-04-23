@@ -362,24 +362,23 @@ class AdaptiveMixing(nn.Module):
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
 
-    def inner_forward(self, x, query, time_diff=None):
+    def _apply_temporal_mamba(self, x, time_diff):
+        B, Q, G, P, C = x.shape
+        T = self.num_frames
+        Pf = P // T
+        # sampling_4d flattens (T, Pf) with T outer: index k -> t = k // Pf, s = k % Pf
+        x_t = x.view(B, Q, G, T, Pf, C)
+        x_t = x_t.permute(0, 1, 2, 4, 3, 5).contiguous()        # [B, Q, G, Pf, T, C]
+        x_seq = x_t.view(B * Q * G * Pf, T, C)
+        x_seq = self.temporal_mamba(x_seq, time_diff, (B, Q, G, Pf))
+        x_t = x_seq.view(B, Q, G, Pf, T, C).permute(0, 1, 2, 4, 3, 5).contiguous()
+        return x_t.view(B, Q, G, P, C)
+
+    def inner_forward(self, x, query):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
-
-        if self.use_bimamba_temporal:
-            assert time_diff is not None, "time_diff is required when use_bimamba_temporal=True"
-            T = self.num_frames
-            Pf = P // T
-            # sampling_4d flattens (T, Pf) with T outer: index k -> t = k // Pf, s = k % Pf
-            x_t = x.view(B, Q, G, T, Pf, C)
-            # reorder so T is the sequence axis, then flatten batch dims
-            x_t = x_t.permute(0, 1, 2, 4, 3, 5).contiguous()        # [B, Q, G, Pf, T, C]
-            x_seq = x_t.view(B * Q * G * Pf, T, C)
-            x_seq = self.temporal_mamba(x_seq, time_diff, (B, Q, G, Pf))
-            x_t = x_seq.view(B, Q, G, Pf, T, C).permute(0, 1, 2, 4, 3, 5).contiguous()
-            x = x_t.view(B, Q, G, P, C)
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
@@ -408,14 +407,19 @@ class AdaptiveMixing(nn.Module):
         return out
 
     def forward(self, x, query, time_diff=None):
+        # Mamba is applied OUTSIDE cp. Two reasons:
+        #   1. Its custom autograd Function saves nn.Parameter leaves; inside
+        #      non-reentrant cp the saved_tensors_hooks break Parameter grad
+        #      accumulators at backward.
+        #   2. Reentrant cp would fix (1) but conflicts with DDP when the
+        #      decoder_layer is shared across 6 iterations (mark-ready-twice).
+        # Mamba is already memory-efficient (SSM state is O(d_state), not O(T^2)),
+        # so not checkpointing it is a small cost. The rest of the mixer still
+        # goes through non-reentrant cp normally.
+        if self.use_bimamba_temporal:
+            assert time_diff is not None, "time_diff is required when use_bimamba_temporal=True"
+            x = self._apply_temporal_mamba(x, time_diff)
         if self.training and x.requires_grad:
-            # Mamba's custom autograd Function saves nn.Parameter leaves; under
-            # non-reentrant cp the saved_tensors_hooks clear their grad
-            # accumulators and backward fails with "No grad accumulator for a
-            # saved leaf". Reentrant cp runs the first forward under no_grad
-            # (Mamba saves nothing) and re-runs in backward with grad enabled
-            # (fresh ctx, live Parameters) — works correctly.
-            use_reentrant = self.use_bimamba_temporal
-            return cp(self.inner_forward, x, query, time_diff, use_reentrant=use_reentrant)
+            return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
-            return self.inner_forward(x, query, time_diff)
+            return self.inner_forward(x, query)
