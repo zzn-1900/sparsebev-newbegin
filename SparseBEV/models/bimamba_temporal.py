@@ -22,14 +22,17 @@ def sinusoidal_time_embedding(time_diff, dim):
 
 
 def _load_mamba_cls():
-    try:
-        from mamba_ssm import Mamba2
-        return Mamba2, 'mamba2'
-    except Exception:
-        pass
+    # Prefer Mamba v1: simpler internal layout, no nheads/headdim split,
+    # so causal_conv1d's channel-last stride-alignment check always passes.
+    # For T=8 the SSD speedup of Mamba2 is irrelevant anyway.
     try:
         from mamba_ssm import Mamba
         return Mamba, 'mamba1'
+    except Exception:
+        pass
+    try:
+        from mamba_ssm import Mamba2
+        return Mamba2, 'mamba2'
     except Exception as e:
         raise RuntimeError(
             "mamba-ssm is required for use_bimamba_temporal=True. On 4090 run:\n"
@@ -40,8 +43,15 @@ def _load_mamba_cls():
 def _build_mamba(d_model, d_state=16, d_conv=4, expand=2):
     cls, kind = _load_mamba_cls()
     if kind == 'mamba2':
+        # Mamba2 builds zxbcdt of width (2*d_inner + 2*ngroups*d_state + nheads).
+        # xBC is a channel-slice of zxbcdt, so its seq/batch stride equals the
+        # full width — causal_conv1d requires that stride to be multiple of 8.
+        # Enforce nheads % 8 == 0 by choosing headdim = d_inner // 8.
         d_inner = d_model * expand
-        headdim = 64 if d_inner % 64 == 0 else (32 if d_inner % 32 == 0 else 16)
+        assert d_inner % 8 == 0, f"d_inner={d_inner} must be divisible by 8"
+        headdim = max(d_inner // 8, 8)
+        while d_inner % headdim != 0:
+            headdim -= 1
         return cls(d_model=d_model, d_state=d_state, d_conv=d_conv,
                    expand=expand, headdim=headdim)
     return cls(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
@@ -83,9 +93,9 @@ class TemporalBiMamba(nn.Module):
         y = self.norm(x + dt.to(x.dtype))
 
         with torch.cuda.amp.autocast(enabled=False):
-            y_fp = y.float()
+            y_fp = y.float().contiguous()
             out_fwd = self.fwd(y_fp)
-            out_bwd = self.bwd(torch.flip(y_fp, dims=[1]))
+            out_bwd = self.bwd(torch.flip(y_fp, dims=[1]).contiguous())
             out_bwd = torch.flip(out_bwd, dims=[1])
             out = out_fwd + out_bwd
 
