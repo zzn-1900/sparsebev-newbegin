@@ -1,7 +1,10 @@
 _base_ = ['./r50_nuimg_704x256.py']
 
 model = dict(
-    pts_bbox_head=dict(num_query=400)
+    pts_bbox_head=dict(
+        num_query=400,
+        num_ego_align_queries=0,
+    )
 )
 
 total_epochs = 36

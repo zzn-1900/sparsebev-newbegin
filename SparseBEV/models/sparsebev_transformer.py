@@ -29,8 +29,10 @@ class SparseBEVTransformer(BaseModule):
     def init_weights(self):
         self.decoder.init_weights()
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
-        cls_scores, bbox_preds = self.decoder(query_bbox, query_feat, mlvl_feats, attn_mask, img_metas)
+    def forward(self, query_bbox, query_feat, query_vel_mask, mlvl_feats, attn_mask, img_metas):
+        cls_scores, bbox_preds = self.decoder(
+            query_bbox, query_feat, query_vel_mask, mlvl_feats, attn_mask, img_metas
+        )
 
         cls_scores = torch.nan_to_num(cls_scores)
         bbox_preds = torch.nan_to_num(bbox_preds)
@@ -53,7 +55,7 @@ class SparseBEVTransformerDecoder(BaseModule):
     def init_weights(self):
         self.decoder_layer.init_weights()
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
+    def forward(self, query_bbox, query_feat, query_vel_mask, mlvl_feats, attn_mask, img_metas):
         cls_scores, bbox_preds = [], []
 
         # calculate time difference according to timestamps
@@ -88,7 +90,7 @@ class SparseBEVTransformerDecoder(BaseModule):
             DUMP.stage_count = i
 
             query_feat, cls_score, bbox_pred = self.decoder_layer(
-                query_bbox, query_feat, mlvl_feats, attn_mask, img_metas
+                query_bbox, query_feat, query_vel_mask, mlvl_feats, attn_mask, img_metas
             )
             query_bbox = bbox_pred.clone().detach()
 
@@ -159,7 +161,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         return torch.cat([xyz_new, bbox_delta[..., 3:]], dim=-1)
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
+    def forward(self, query_bbox, query_feat, query_vel_mask, mlvl_feats, attn_mask, img_metas):
         """
         query_bbox: [B, Q, 10] [cx, cy, cz, w, h, d, rot.sin, rot.cos, vx, vy]
         """
@@ -167,7 +169,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat = self.sampling(query_bbox, query_feat, query_vel_mask, mlvl_feats, img_metas)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -267,7 +269,7 @@ class SparseBEVSampling(BaseModule):
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
 
-    def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
+    def inner_forward(self, query_bbox, query_feat, query_vel_mask, mlvl_feats, img_metas):
         '''
         query_bbox: [B, Q, 10]
         query_feat: [B, Q, C]
@@ -288,6 +290,8 @@ class SparseBEVSampling(BaseModule):
         vel = query_bbox[..., 8:].detach()  # [B, Q, 2]
         vel = vel[:, :, None, :]  # [B, Q, 1, 2]
         dist = vel * time_diff  # [B, Q, F, 2]
+        query_vel_mask = query_vel_mask[:, :, None, None].to(dist.dtype)  # [B, Q, 1, 1]
+        dist = dist * query_vel_mask
         dist = dist[:, :, :, None, None, :]  # [B, Q, F, 1, 1, 2]
         sampling_points = torch.cat([
             sampling_points[..., 0:2] - dist,
@@ -310,11 +314,14 @@ class SparseBEVSampling(BaseModule):
 
         return sampled_feats
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
+    def forward(self, query_bbox, query_feat, query_vel_mask, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
-            return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
+            return cp(
+                self.inner_forward, query_bbox, query_feat, query_vel_mask, mlvl_feats, img_metas,
+                use_reentrant=False
+            )
         else:
-            return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
+            return self.inner_forward(query_bbox, query_feat, query_vel_mask, mlvl_feats, img_metas)
 
 
 class AdaptiveMixing(nn.Module):

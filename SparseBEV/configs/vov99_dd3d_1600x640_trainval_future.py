@@ -44,6 +44,7 @@ model = dict(
     img_neck=img_neck,
     pts_bbox_head=dict(
         num_query=1600,
+        num_ego_align_queries=0,
         transformer=dict(
             num_levels=5,
             num_points=4,
