@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -15,7 +16,20 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self,
+                 embed_dims,
+                 num_frames=8,
+                 num_points=4,
+                 num_layers=6,
+                 num_levels=4,
+                 num_classes=10,
+                 code_size=10,
+                 pc_range=[],
+                 history_frame_gate=False,
+                 history_gate_hidden_dim=None,
+                 history_gate_tau_point=1.0,
+                 history_gate_tau_frame=1.0,
+                 init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +37,20 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(
+            embed_dims,
+            num_frames,
+            num_points,
+            num_layers,
+            num_levels,
+            num_classes,
+            code_size,
+            pc_range=pc_range,
+            history_frame_gate=history_frame_gate,
+            history_gate_hidden_dim=history_gate_hidden_dim,
+            history_gate_tau_point=history_gate_tau_point,
+            history_gate_tau_frame=history_gate_tau_frame,
+        )
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +66,37 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self,
+                 embed_dims,
+                 num_frames=8,
+                 num_points=4,
+                 num_layers=6,
+                 num_levels=4,
+                 num_classes=10,
+                 code_size=10,
+                 pc_range=[],
+                 history_frame_gate=False,
+                 history_gate_hidden_dim=None,
+                 history_gate_tau_point=1.0,
+                 history_gate_tau_frame=1.0,
+                 init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims,
+            num_frames,
+            num_points,
+            num_levels,
+            num_classes,
+            code_size,
+            pc_range=pc_range,
+            history_frame_gate=history_frame_gate,
+            history_gate_hidden_dim=history_gate_hidden_dim,
+            history_gate_tau_point=history_gate_tau_point,
+            history_gate_tau_frame=history_gate_tau_frame,
         )
 
     @torch.no_grad()
@@ -102,7 +152,21 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self,
+                 embed_dims,
+                 num_frames=8,
+                 num_points=4,
+                 num_levels=4,
+                 num_classes=10,
+                 code_size=10,
+                 num_cls_fcs=2,
+                 num_reg_fcs=2,
+                 pc_range=[],
+                 history_frame_gate=False,
+                 history_gate_hidden_dim=None,
+                 history_gate_tau_point=1.0,
+                 history_gate_tau_frame=1.0,
+                 init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -120,7 +184,18 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         )
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
-        self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.sampling = SparseBEVSampling(
+            embed_dims,
+            num_frames=num_frames,
+            num_groups=4,
+            num_points=num_points,
+            num_levels=num_levels,
+            pc_range=pc_range,
+            history_frame_gate=history_frame_gate,
+            history_gate_hidden_dim=history_gate_hidden_dim,
+            history_gate_tau_point=history_gate_tau_point,
+            history_gate_tau_frame=history_gate_tau_frame,
+        )
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -250,7 +325,18 @@ class SparseBEVSelfAttention(BaseModule):
 
 class SparseBEVSampling(BaseModule):
     """Adaptive Spatio-temporal Sampling"""
-    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], init_cfg=None):
+    def __init__(self,
+                 embed_dims=256,
+                 num_frames=4,
+                 num_groups=4,
+                 num_points=8,
+                 num_levels=4,
+                 pc_range=[],
+                 history_frame_gate=False,
+                 history_gate_hidden_dim=None,
+                 history_gate_tau_point=1.0,
+                 history_gate_tau_frame=1.0,
+                 init_cfg=None):
         super().__init__(init_cfg)
 
         self.num_frames = num_frames
@@ -258,14 +344,64 @@ class SparseBEVSampling(BaseModule):
         self.num_groups = num_groups
         self.num_levels = num_levels
         self.pc_range = pc_range
+        self.history_frame_gate = history_frame_gate
+        self.history_gate_tau_point = history_gate_tau_point
+        self.history_gate_tau_frame = history_gate_tau_frame
+        self.group_embed_dims = embed_dims // num_groups
 
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
         self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
+        if self.history_frame_gate:
+            hidden_dim = history_gate_hidden_dim if history_gate_hidden_dim is not None else self.group_embed_dims
+            self.history_query_ref = nn.Linear(embed_dims, embed_dims)
+            self.history_point_scorer = nn.Sequential(
+                nn.Linear(self.group_embed_dims * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.history_gate_alpha = nn.Parameter(torch.tensor(0.01))
+            self.history_uncertainty_scale = nn.Parameter(torch.tensor(-2.0))
+            self.history_gate_bias = nn.Parameter(torch.tensor(0.0))
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+        if self.history_frame_gate:
+            nn.init.zeros_(self.history_point_scorer[-1].weight)
+            nn.init.zeros_(self.history_point_scorer[-1].bias)
+
+    def apply_history_frame_gate(self, sampled_feats, query_feat):
+        if not self.history_frame_gate or self.num_frames <= 1:
+            return sampled_feats
+
+        B, Q, G, _, C = sampled_feats.shape
+        num_hist_frames = self.num_frames - 1
+        tau_point = max(self.history_gate_tau_point, 1e-5)
+        tau_frame = max(self.history_gate_tau_frame, 1e-5)
+
+        sampled_feats = sampled_feats.reshape(B, Q, G, self.num_frames, self.num_points, C)
+        hist_feats = sampled_feats[:, :, :, 1:]  # [B, Q, G, H, P, C]
+
+        query_ref = self.history_query_ref(query_feat)
+        query_ref = query_ref.view(B, Q, G, 1, 1, self.group_embed_dims).expand_as(hist_feats)
+
+        point_inputs = torch.cat([query_ref, hist_feats], dim=-1)
+        point_score = self.history_point_scorer(point_inputs).squeeze(-1)  # [B, Q, G, H, P]
+        frame_score = tau_point * torch.logsumexp(point_score / tau_point, dim=-1)
+        frame_score = frame_score - tau_point * math.log(self.num_points)  # [B, Q, G, H]
+        frame_uncertainty = point_score.std(dim=-1, unbiased=False)  # [B, Q, G, H]
+        uncertainty_scale = F.softplus(self.history_uncertainty_scale)
+        frame_logit = frame_score - uncertainty_scale * frame_uncertainty + self.history_gate_bias
+        hist_weight = torch.sigmoid(frame_logit / tau_frame)  # [B, Q, G, H]
+
+        alpha = torch.tanh(self.history_gate_alpha)
+        gate = 1.0 + alpha * (2.0 * hist_weight[:, :, :, :, None, None] - 1.0)
+        hist_feats = hist_feats * gate
+
+        sampled_feats = torch.cat([sampled_feats[:, :, :, :1], hist_feats], dim=3)
+        return sampled_feats.reshape(B, Q, G, self.num_frames * self.num_points, C)
 
     def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         '''
@@ -307,6 +443,7 @@ class SparseBEVSampling(BaseModule):
             img_metas[0]['lidar2img'],
             image_h, image_w
         )  # [B, Q, G, FP, C]
+        sampled_feats = self.apply_history_frame_gate(sampled_feats, query_feat)
 
         return sampled_feats
 
