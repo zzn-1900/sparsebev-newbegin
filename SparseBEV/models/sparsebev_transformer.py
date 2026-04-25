@@ -46,7 +46,8 @@ class SparseBEVTransformerDecoder(BaseModule):
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size,
+            num_layers=num_layers, pc_range=pc_range
         )
 
     @torch.no_grad()
@@ -88,7 +89,7 @@ class SparseBEVTransformerDecoder(BaseModule):
             DUMP.stage_count = i
 
             query_feat, cls_score, bbox_pred = self.decoder_layer(
-                query_bbox, query_feat, mlvl_feats, attn_mask, img_metas
+                query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, layer_idx=i
             )
             query_bbox = bbox_pred.clone().detach()
 
@@ -102,7 +103,7 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_layers=6, last_n_gate_layers=2, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -121,7 +122,10 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.frame_gate = FrameSemanticGate(embed_dims, num_groups=4, num_frames=num_frames)
+        self.frame_gate = FrameSemanticGate(
+            embed_dims, num_groups=4, num_frames=num_frames,
+            num_layers=num_layers, last_n_layers=last_n_gate_layers,
+        )
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -161,7 +165,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         return torch.cat([xyz_new, bbox_delta[..., 3:]], dim=-1)
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, layer_idx=0):
         """
         query_bbox: [B, Q, 10] [cx, cy, cz, w, h, d, rot.sin, rot.cos, vx, vy]
         """
@@ -170,7 +174,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
         sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        sampled_feat = self.frame_gate(sampled_feat, query_feat)
+        sampled_feat = self.frame_gate(sampled_feat, query_feat, layer_idx)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -330,12 +334,16 @@ class FrameSemanticGate(BaseModule):
     that point. The current frame is left ungated.
     """
     def __init__(self, embed_dims=256, num_groups=4, num_frames=8,
+                 num_layers=6, last_n_layers=2, history_frames=7,
                  log_interval=50, log_path='frame_gate_stats.jsonl', init_cfg=None):
         super().__init__(init_cfg)
         self.num_groups = num_groups
         self.num_frames = num_frames
+        self.history_frames = min(history_frames, max(0, num_frames - 1))
         self.eff_dim = embed_dims // num_groups
         self.scale = self.eff_dim ** -0.5
+        self.start_stage = max(0, num_layers - last_n_layers)
+        self.log_stage = num_layers - 1
 
         self.ref_proj = nn.Linear(embed_dims, embed_dims)
         self.gate_weight = nn.Parameter(torch.zeros(num_groups, self.eff_dim, 1))
@@ -351,18 +359,18 @@ class FrameSemanticGate(BaseModule):
         nn.init.constant_(self.gate_bias, 4.0)
 
     @torch.no_grad()
-    def _log_gate_stats(self, gate_raw):
-        """gate_raw: [B, Q, G, F, P], after sigmoid, before current-frame override."""
+    def _log_gate_stats(self, gate_history):
+        """gate_history: [B, Q, G, H, P], post-sigmoid gate for history frames."""
         if not self.log_path:
             return
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
                 return
 
-        per_frame = gate_raw.mean(dim=(0, 1, 2, 4))           # [F]
-        p_std = gate_raw.std(dim=4).mean(dim=(0, 1, 2))       # [F]
-        per_group = gate_raw.mean(dim=(0, 1, 3, 4))           # [G]
-        per_group_frame = gate_raw.mean(dim=(0, 1, 4))        # [G, F]
+        per_frame = gate_history.mean(dim=(0, 1, 2, 4))            # [H]
+        p_std = gate_history.std(dim=4).mean(dim=(0, 1, 2))        # [H]
+        per_group = gate_history.mean(dim=(0, 1, 3, 4))            # [G]
+        per_group_frame = gate_history.mean(dim=(0, 1, 4))         # [G, H]
 
         def r1(t):
             return [round(float(v), 4) for v in t.tolist()]
@@ -382,38 +390,49 @@ class FrameSemanticGate(BaseModule):
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record) + '\n')
 
-    def inner_forward(self, sampled_feat, query_feat):
+    def inner_forward(self, sampled_feat, query_feat, layer_idx):
+        # Bypass early decoder layers where query_feat hasn't accumulated useful signal
+        if layer_idx < self.start_stage:
+            return sampled_feat
+
         B, Q, G, FP, C_g = sampled_feat.shape
         F_ = self.num_frames
-        if F_ <= 1:
+        H = self.history_frames
+        if F_ <= 1 or H <= 0:
             return sampled_feat
         P = FP // F_
+        history_slots = H * P
 
         ref = self.ref_proj(query_feat).view(B, Q, G, C_g)
 
-        inter = ref[:, :, :, None, :] * sampled_feat                # [B,Q,G,FP,C_g]
-        gate = torch.matmul(inter, self.gate_weight) * self.scale   # [B,Q,G,FP,1]
-        gate = gate.view(B, Q, G, F_, P)
+        # Compute gate only on the 7 history frames after the current frame.
+        history = sampled_feat[:, :, :, P:P + history_slots]              # [B,Q,G,H*P,C_g]
+        inter = ref[:, :, :, None, :] * history                           # [B,Q,G,H*P,C_g]
+        gate = torch.matmul(inter, self.gate_weight) * self.scale         # [B,Q,G,H*P,1]
+        gate = gate.view(B, Q, G, H, P)
         gate = torch.sigmoid(gate + self.gate_bias[None, None, :, None, None])
 
-        if self.training and DUMP.stage_count == 0:
+        if self.training and layer_idx == self.log_stage:
             self._step += 1
             if self.log_interval > 0 and self._step % self.log_interval == 0:
                 self._log_gate_stats(gate)
 
-        gate = torch.cat([
-            torch.ones_like(gate[:, :, :, :1]),
-            gate[:, :, :, 1:]
-        ], dim=3)
-        gate = gate.view(B, Q, G, FP, 1)
-
-        return sampled_feat * gate
-
-    def forward(self, sampled_feat, query_feat):
-        if self.training and sampled_feat.requires_grad:
-            return cp(self.inner_forward, sampled_feat, query_feat, use_reentrant=False)
+        ones_curr = sampled_feat.new_ones(B, Q, G, P, 1)
+        gate_history = gate.view(B, Q, G, history_slots, 1)
+        tail_slots = FP - P - history_slots
+        if tail_slots > 0:
+            ones_tail = sampled_feat.new_ones(B, Q, G, tail_slots, 1)
+            gate_full = torch.cat([ones_curr, gate_history, ones_tail], dim=3)
         else:
-            return self.inner_forward(sampled_feat, query_feat)
+            gate_full = torch.cat([ones_curr, gate_history], dim=3)
+
+        return sampled_feat * gate_full
+
+    def forward(self, sampled_feat, query_feat, layer_idx):
+        if self.training and sampled_feat.requires_grad:
+            return cp(self.inner_forward, sampled_feat, query_feat, layer_idx, use_reentrant=False)
+        else:
+            return self.inner_forward(sampled_feat, query_feat, layer_idx)
 
 
 class AdaptiveMixing(nn.Module):
