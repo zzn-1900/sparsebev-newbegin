@@ -351,19 +351,19 @@ class FrameSemanticGate(BaseModule):
         P = FP // F_
 
         ref = self.ref_proj(query_feat).view(B, Q, G, C_g)
-        feat = sampled_feat.view(B, Q, G, F_, P, C_g)
 
-        inter = ref[:, :, :, None, None, :] * feat
-        gate = torch.einsum('bqgfpc,gcd->bqgfpd', inter, self.gate_weight) * self.scale
+        inter = ref[:, :, :, None, :] * sampled_feat                # [B,Q,G,FP,C_g]
+        gate = torch.matmul(inter, self.gate_weight) * self.scale   # [B,Q,G,FP,C_g]
+        gate = gate.view(B, Q, G, F_, P, C_g)
         gate = torch.sigmoid(gate + self.gate_bias[:, None, None, :])
 
         gate = torch.cat([
             torch.ones_like(gate[:, :, :, :1]),
             gate[:, :, :, 1:]
         ], dim=3)
+        gate = gate.view(B, Q, G, FP, C_g)
 
-        feat = feat * gate
-        return feat.view(B, Q, G, FP, C_g)
+        return sampled_feat * gate
 
     def forward(self, sampled_feat, query_feat):
         if self.training and sampled_feat.requires_grad:
