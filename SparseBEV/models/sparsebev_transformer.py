@@ -325,7 +325,9 @@ class FrameSemanticGate(BaseModule):
 
     Generates G reference vectors from query_feat, takes the Hadamard product
     with sampled_feat to model AND-like containment, then a per-group linear
-    produces a channel-wise sigmoid gate. The current frame is left ungated.
+    fuses the 64-d co-activation evidence into a single per-point credibility
+    score. Sigmoid produces a scalar gate broadcast across all channels of
+    that point. The current frame is left ungated.
     """
     def __init__(self, embed_dims=256, num_groups=4, num_frames=8, init_cfg=None):
         super().__init__(init_cfg)
@@ -335,8 +337,8 @@ class FrameSemanticGate(BaseModule):
         self.scale = self.eff_dim ** -0.5
 
         self.ref_proj = nn.Linear(embed_dims, embed_dims)
-        self.gate_weight = nn.Parameter(torch.zeros(num_groups, self.eff_dim, self.eff_dim))
-        self.gate_bias = nn.Parameter(torch.full((num_groups, self.eff_dim), 4.0))
+        self.gate_weight = nn.Parameter(torch.zeros(num_groups, self.eff_dim, 1))
+        self.gate_bias = nn.Parameter(torch.full((num_groups,), 4.0))
 
     @torch.no_grad()
     def init_weights(self):
@@ -353,15 +355,15 @@ class FrameSemanticGate(BaseModule):
         ref = self.ref_proj(query_feat).view(B, Q, G, C_g)
 
         inter = ref[:, :, :, None, :] * sampled_feat                # [B,Q,G,FP,C_g]
-        gate = torch.matmul(inter, self.gate_weight) * self.scale   # [B,Q,G,FP,C_g]
-        gate = gate.view(B, Q, G, F_, P, C_g)
-        gate = torch.sigmoid(gate + self.gate_bias[:, None, None, :])
+        gate = torch.matmul(inter, self.gate_weight) * self.scale   # [B,Q,G,FP,1]
+        gate = gate.view(B, Q, G, F_, P)
+        gate = torch.sigmoid(gate + self.gate_bias[None, None, :, None, None])
 
         gate = torch.cat([
             torch.ones_like(gate[:, :, :, :1]),
             gate[:, :, :, 1:]
         ], dim=3)
-        gate = gate.view(B, Q, G, FP, C_g)
+        gate = gate.view(B, Q, G, FP, 1)
 
         return sampled_feat * gate
 
