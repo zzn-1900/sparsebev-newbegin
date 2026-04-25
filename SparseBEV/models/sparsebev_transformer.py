@@ -329,7 +329,8 @@ class FrameSemanticGate(BaseModule):
     score. Sigmoid produces a scalar gate broadcast across all channels of
     that point. The current frame is left ungated.
     """
-    def __init__(self, embed_dims=256, num_groups=4, num_frames=8, init_cfg=None):
+    def __init__(self, embed_dims=256, num_groups=4, num_frames=8,
+                 log_interval=50, log_path='frame_gate_stats.jsonl', init_cfg=None):
         super().__init__(init_cfg)
         self.num_groups = num_groups
         self.num_frames = num_frames
@@ -340,10 +341,46 @@ class FrameSemanticGate(BaseModule):
         self.gate_weight = nn.Parameter(torch.zeros(num_groups, self.eff_dim, 1))
         self.gate_bias = nn.Parameter(torch.full((num_groups,), 4.0))
 
+        self.log_interval = log_interval
+        self.log_path = log_path
+        self._step = 0
+
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.gate_weight)
         nn.init.constant_(self.gate_bias, 4.0)
+
+    @torch.no_grad()
+    def _log_gate_stats(self, gate_raw):
+        """gate_raw: [B, Q, G, F, P], after sigmoid, before current-frame override."""
+        if not self.log_path:
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+
+        per_frame = gate_raw.mean(dim=(0, 1, 2, 4))           # [F]
+        p_std = gate_raw.std(dim=4).mean(dim=(0, 1, 2))       # [F]
+        per_group = gate_raw.mean(dim=(0, 1, 3, 4))           # [G]
+        per_group_frame = gate_raw.mean(dim=(0, 1, 4))        # [G, F]
+
+        def r1(t):
+            return [round(float(v), 4) for v in t.tolist()]
+
+        def r2(t):
+            return [[round(float(v), 4) for v in row] for row in t.tolist()]
+
+        record = {
+            'step': self._step,
+            'frame_mean': r1(per_frame),
+            'p_std': r1(p_std),
+            'group_mean': r1(per_group),
+            'group_frame_mean': r2(per_group_frame),
+        }
+
+        import json
+        with open(self.log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record) + '\n')
 
     def inner_forward(self, sampled_feat, query_feat):
         B, Q, G, FP, C_g = sampled_feat.shape
@@ -358,6 +395,11 @@ class FrameSemanticGate(BaseModule):
         gate = torch.matmul(inter, self.gate_weight) * self.scale   # [B,Q,G,FP,1]
         gate = gate.view(B, Q, G, F_, P)
         gate = torch.sigmoid(gate + self.gate_bias[None, None, :, None, None])
+
+        if self.training and DUMP.stage_count == 0:
+            self._step += 1
+            if self.log_interval > 0 and self._step % self.log_interval == 0:
+                self._log_gate_stats(gate)
 
         gate = torch.cat([
             torch.ones_like(gate[:, :, :, :1]),
