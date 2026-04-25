@@ -121,6 +121,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.frame_gate = FrameSemanticGate(embed_dims, num_groups=4, num_frames=num_frames)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -147,6 +148,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
     def init_weights(self):
         self.self_attn.init_weights()
         self.sampling.init_weights()
+        self.frame_gate.init_weights()
         self.mixing.init_weights()
 
         bias_init = bias_init_with_prob(0.01)
@@ -168,6 +170,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
         sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat = self.frame_gate(sampled_feat, query_feat)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -315,6 +318,58 @@ class SparseBEVSampling(BaseModule):
             return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
         else:
             return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
+
+
+class FrameSemanticGate(BaseModule):
+    """Semantic frame-level filtering before temporal mixing.
+
+    Generates G reference vectors from query_feat, takes the Hadamard product
+    with sampled_feat to model AND-like containment, then a per-group linear
+    produces a channel-wise sigmoid gate. The current frame is left ungated.
+    """
+    def __init__(self, embed_dims=256, num_groups=4, num_frames=8, init_cfg=None):
+        super().__init__(init_cfg)
+        self.num_groups = num_groups
+        self.num_frames = num_frames
+        self.eff_dim = embed_dims // num_groups
+        self.scale = self.eff_dim ** -0.5
+
+        self.ref_proj = nn.Linear(embed_dims, embed_dims)
+        self.gate_weight = nn.Parameter(torch.zeros(num_groups, self.eff_dim, self.eff_dim))
+        self.gate_bias = nn.Parameter(torch.full((num_groups, self.eff_dim), 4.0))
+
+    @torch.no_grad()
+    def init_weights(self):
+        nn.init.zeros_(self.gate_weight)
+        nn.init.constant_(self.gate_bias, 4.0)
+
+    def inner_forward(self, sampled_feat, query_feat):
+        B, Q, G, FP, C_g = sampled_feat.shape
+        F_ = self.num_frames
+        if F_ <= 1:
+            return sampled_feat
+        P = FP // F_
+
+        ref = self.ref_proj(query_feat).view(B, Q, G, C_g)
+        feat = sampled_feat.view(B, Q, G, F_, P, C_g)
+
+        inter = ref[:, :, :, None, None, :] * feat
+        gate = torch.einsum('bqgfpc,gcd->bqgfpd', inter, self.gate_weight) * self.scale
+        gate = torch.sigmoid(gate + self.gate_bias[:, None, None, :])
+
+        gate = torch.cat([
+            torch.ones_like(gate[:, :, :, :1]),
+            gate[:, :, :, 1:]
+        ], dim=3)
+
+        feat = feat * gate
+        return feat.view(B, Q, G, FP, C_g)
+
+    def forward(self, sampled_feat, query_feat):
+        if self.training and sampled_feat.requires_grad:
+            return cp(self.inner_forward, sampled_feat, query_feat, use_reentrant=False)
+        else:
+            return self.inner_forward(sampled_feat, query_feat)
 
 
 class AdaptiveMixing(nn.Module):
