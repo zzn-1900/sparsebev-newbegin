@@ -103,7 +103,7 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_layers=6, last_n_gate_layers=2, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_layers=6, last_n_gate_layers=1, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -123,7 +123,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
         self.frame_gate = FrameSemanticGate(
-            embed_dims, num_groups=4, num_frames=num_frames,
+            embed_dims, num_groups=4, num_frames=num_frames, num_points=num_points,
             num_layers=num_layers, last_n_layers=last_n_gate_layers,
         )
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
@@ -328,25 +328,30 @@ class FrameSemanticGate(BaseModule):
     """Semantic frame-level filtering before temporal mixing.
 
     Generates G reference vectors from query_feat, takes the Hadamard product
-    with sampled_feat to model AND-like containment, then a per-group linear
-    fuses the 64-d co-activation evidence into a single per-point credibility
-    score. Sigmoid produces a scalar gate broadcast across all channels of
-    that point. The current frame is left ungated.
+    with sampled_feat to model AND-like containment, then concatenates all
+    points from the same group/frame and predicts one shared credibility
+    score for that group/frame. The current frame is left ungated.
     """
     def __init__(self, embed_dims=256, num_groups=4, num_frames=8,
+                 num_points=4, gate_hidden_dim=None,
                  num_layers=6, last_n_layers=2, history_frames=7,
                  log_interval=50, log_path='frame_gate_stats.jsonl', init_cfg=None):
         super().__init__(init_cfg)
         self.num_groups = num_groups
         self.num_frames = num_frames
+        self.num_points = num_points
         self.history_frames = min(history_frames, max(0, num_frames - 1))
         self.eff_dim = embed_dims // num_groups
-        self.scale = self.eff_dim ** -0.5
+        self.gate_input_dim = num_points * self.eff_dim
+        self.gate_hidden_dim = gate_hidden_dim or 64
+        self.scale = self.gate_input_dim ** -0.5
         self.start_stage = max(0, num_layers - last_n_layers)
         self.log_stage = num_layers - 1
 
         self.ref_proj = nn.Linear(embed_dims, embed_dims)
-        self.gate_weight = nn.Parameter(torch.zeros(num_groups, self.eff_dim, 1))
+        self.gate_fc1_weight = nn.Parameter(torch.empty(num_groups, self.gate_input_dim, self.gate_hidden_dim))
+        self.gate_fc1_bias = nn.Parameter(torch.zeros(num_groups, self.gate_hidden_dim))
+        self.gate_fc2_weight = nn.Parameter(torch.zeros(num_groups, self.gate_hidden_dim, 1))
         self.gate_bias = nn.Parameter(torch.full((num_groups,), 4.0))
 
         self.log_interval = log_interval
@@ -355,22 +360,26 @@ class FrameSemanticGate(BaseModule):
 
     @torch.no_grad()
     def init_weights(self):
-        nn.init.zeros_(self.gate_weight)
+        for g in range(self.num_groups):
+            nn.init.xavier_uniform_(self.gate_fc1_weight[g])
+        nn.init.zeros_(self.gate_fc1_bias)
+        nn.init.zeros_(self.gate_fc2_weight)
         nn.init.constant_(self.gate_bias, 4.0)
 
     @torch.no_grad()
     def _log_gate_stats(self, gate_history):
-        """gate_history: [B, Q, G, H, P], post-sigmoid gate for history frames."""
+        """gate_history: [B, Q, G, H], post-sigmoid shared gate for history frames."""
         if not self.log_path:
             return
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
                 return
 
-        per_frame = gate_history.mean(dim=(0, 1, 2, 4))            # [H]
-        p_std = gate_history.std(dim=4).mean(dim=(0, 1, 2))        # [H]
-        per_group = gate_history.mean(dim=(0, 1, 3, 4))            # [G]
-        per_group_frame = gate_history.mean(dim=(0, 1, 4))         # [G, H]
+        per_frame = gate_history.mean(dim=(0, 1, 2))               # [H]
+        per_frame_std = gate_history.std(dim=(0, 1, 2))            # [H]
+        per_group = gate_history.mean(dim=(0, 1, 3))               # [G]
+        per_group_frame = gate_history.mean(dim=(0, 1))            # [G, H]
+        per_group_frame_std = gate_history.std(dim=(0, 1))         # [G, H]
 
         def r1(t):
             return [round(float(v), 4) for v in t.tolist()]
@@ -380,15 +389,29 @@ class FrameSemanticGate(BaseModule):
 
         record = {
             'step': self._step,
+            'shared_scope': 'group_frame',
+            'point_shared': True,
+            'num_points': self.num_points,
+            'gate_hidden_dim': self.gate_hidden_dim,
             'frame_mean': r1(per_frame),
-            'p_std': r1(p_std),
+            'frame_std': r1(per_frame_std),
             'group_mean': r1(per_group),
             'group_frame_mean': r2(per_group_frame),
+            'group_frame_std': r2(per_group_frame_std),
         }
 
         import json
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record) + '\n')
+
+    def _group_gate_mlp(self, gate_input, B, Q, H):
+        gate_input = gate_input.permute(2, 0, 1, 3, 4).reshape(self.num_groups, B * Q * H, self.gate_input_dim)
+        hidden = torch.bmm(gate_input, self.gate_fc1_weight)
+        hidden = hidden + self.gate_fc1_bias[:, None, :]
+        hidden = F.relu(hidden, inplace=True)
+        logits = torch.bmm(hidden, self.gate_fc2_weight).view(self.num_groups, B, Q, H)
+        logits = logits.permute(1, 2, 0, 3).contiguous()
+        return logits * self.scale
 
     def inner_forward(self, sampled_feat, query_feat, layer_idx):
         # Bypass early decoder layers where query_feat hasn't accumulated useful signal
@@ -396,21 +419,25 @@ class FrameSemanticGate(BaseModule):
             return sampled_feat
 
         B, Q, G, FP, C_g = sampled_feat.shape
+        assert G == self.num_groups
+        assert C_g == self.eff_dim
         F_ = self.num_frames
         H = self.history_frames
         if F_ <= 1 or H <= 0:
             return sampled_feat
         P = FP // F_
+        assert P == self.num_points
         history_slots = H * P
 
         ref = self.ref_proj(query_feat).view(B, Q, G, C_g)
 
-        # Compute gate only on the 7 history frames after the current frame.
+        # Compute one shared gate for each group/frame from all P history points.
         history = sampled_feat[:, :, :, P:P + history_slots]              # [B,Q,G,H*P,C_g]
-        inter = ref[:, :, :, None, :] * history                           # [B,Q,G,H*P,C_g]
-        gate = torch.matmul(inter, self.gate_weight) * self.scale         # [B,Q,G,H*P,1]
-        gate = gate.view(B, Q, G, H, P)
-        gate = torch.sigmoid(gate + self.gate_bias[None, None, :, None, None])
+        history = history.reshape(B, Q, G, H, P, C_g)
+        gate_input = ref[:, :, :, None, None, :] * history                # [B,Q,G,H,P,C_g]
+        gate_input = gate_input.reshape(B, Q, G, H, P * C_g)
+        gate = self._group_gate_mlp(gate_input, B, Q, H)                 # [B,Q,G,H]
+        gate = torch.sigmoid(gate + self.gate_bias[None, None, :, None])
 
         if self.training and layer_idx == self.log_stage:
             self._step += 1
@@ -418,7 +445,8 @@ class FrameSemanticGate(BaseModule):
                 self._log_gate_stats(gate)
 
         ones_curr = sampled_feat.new_ones(B, Q, G, P, 1)
-        gate_history = gate.view(B, Q, G, history_slots, 1)
+        gate_history = gate[:, :, :, :, None, None].expand(B, Q, G, H, P, 1)
+        gate_history = gate_history.reshape(B, Q, G, history_slots, 1)
         tail_slots = FP - P - history_slots
         if tail_slots > 0:
             ones_tail = sampled_feat.new_ones(B, Q, G, tail_slots, 1)
