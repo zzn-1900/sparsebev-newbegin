@@ -174,7 +174,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
         sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        sampled_feat = self.frame_gate(sampled_feat, query_feat, layer_idx)
+        sampled_feat = self.frame_gate(sampled_feat, query_feat, layer_idx, img_metas[0]['time_diff'])
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -367,7 +367,7 @@ class FrameSemanticGate(BaseModule):
         nn.init.constant_(self.gate_bias, 4.0)
 
     @torch.no_grad()
-    def _log_gate_stats(self, gate_history):
+    def _log_gate_stats(self, gate_history, time_diff=None):
         """gate_history: [B, Q, G, H], post-sigmoid shared gate for history frames."""
         if not self.log_path:
             return
@@ -376,29 +376,33 @@ class FrameSemanticGate(BaseModule):
                 return
 
         per_frame = gate_history.mean(dim=(0, 1, 2))               # [H]
-        per_frame_std = gate_history.std(dim=(0, 1, 2))            # [H]
         per_group = gate_history.mean(dim=(0, 1, 3))               # [G]
         per_group_frame = gate_history.mean(dim=(0, 1))            # [G, H]
-        per_group_frame_std = gate_history.std(dim=(0, 1))         # [G, H]
 
         def r1(t):
-            return [round(float(v), 4) for v in t.tolist()]
+            return [round(float(v), 4) for v in t.detach().cpu().tolist()]
 
-        def r2(t):
-            return [[round(float(v), 4) for v in row] for row in t.tolist()]
+        def rs(t):
+            return round(float(t.detach().cpu()), 4)
+
+        H = gate_history.size(-1)
+        min_idx = int(per_group_frame.flatten().argmin().item())
+        max_idx = int(per_group_frame.flatten().argmax().item())
+        min_group, min_frame = divmod(min_idx, H)
+        max_group, max_frame = divmod(max_idx, H)
 
         record = {
             'step': self._step,
-            'shared_scope': 'group_frame',
-            'point_shared': True,
-            'num_points': self.num_points,
-            'gate_hidden_dim': self.gate_hidden_dim,
             'frame_mean': r1(per_frame),
-            'frame_std': r1(per_frame_std),
+            'frame_delta': r1(per_frame - per_frame[:1]),
             'group_mean': r1(per_group),
-            'group_frame_mean': r2(per_group_frame),
-            'group_frame_std': r2(per_group_frame_std),
+            'min_group_frame': [min_group, min_frame, rs(per_group_frame[min_group, min_frame])],
+            'max_group_frame': [max_group, max_frame, rs(per_group_frame[max_group, max_frame])],
         }
+        if time_diff is not None and time_diff.dim() == 2 and time_diff.size(1) > 1:
+            history_time_diff = time_diff[:, 1:1 + H]
+            if history_time_diff.size(1) == H:
+                record['history_time_diff'] = r1(history_time_diff.mean(dim=0))
 
         import json
         with open(self.log_path, 'a', encoding='utf-8') as f:
@@ -413,7 +417,7 @@ class FrameSemanticGate(BaseModule):
         logits = logits.permute(1, 2, 0, 3).contiguous()
         return logits * self.scale
 
-    def inner_forward(self, sampled_feat, query_feat, layer_idx):
+    def inner_forward(self, sampled_feat, query_feat, layer_idx, time_diff=None):
         # Bypass early decoder layers where query_feat hasn't accumulated useful signal
         if layer_idx < self.start_stage:
             return sampled_feat
@@ -442,7 +446,7 @@ class FrameSemanticGate(BaseModule):
         if self.training and layer_idx == self.log_stage:
             self._step += 1
             if self.log_interval > 0 and self._step % self.log_interval == 0:
-                self._log_gate_stats(gate)
+                self._log_gate_stats(gate, time_diff)
 
         ones_curr = sampled_feat.new_ones(B, Q, G, P, 1)
         gate_history = gate[:, :, :, :, None, None].expand(B, Q, G, H, P, 1)
@@ -456,11 +460,11 @@ class FrameSemanticGate(BaseModule):
 
         return sampled_feat * gate_full
 
-    def forward(self, sampled_feat, query_feat, layer_idx):
+    def forward(self, sampled_feat, query_feat, layer_idx, time_diff=None):
         if self.training and sampled_feat.requires_grad:
-            return cp(self.inner_forward, sampled_feat, query_feat, layer_idx, use_reentrant=False)
+            return cp(self.inner_forward, sampled_feat, query_feat, layer_idx, time_diff, use_reentrant=False)
         else:
-            return self.inner_forward(sampled_feat, query_feat, layer_idx)
+            return self.inner_forward(sampled_feat, query_feat, layer_idx, time_diff)
 
 
 class AdaptiveMixing(nn.Module):
