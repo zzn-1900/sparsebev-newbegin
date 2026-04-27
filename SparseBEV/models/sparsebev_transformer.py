@@ -121,7 +121,15 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(
+            in_dim=embed_dims,
+            in_points=num_points * num_frames,
+            n_groups=4,
+            out_points=8,
+            num_frames=num_frames,
+            temporal_layers=1,
+            temporal_heads=4,
+        )
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -168,7 +176,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
         sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, img_metas[0]['time_diff']))
         query_feat = self.norm3(self.ffn(query_feat))
 
         cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
@@ -317,14 +325,44 @@ class SparseBEVSampling(BaseModule):
             return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
 
 
+class TransformerMixingBlock(nn.Module):
+    def __init__(self, embed_dims, num_heads=4, feedforward_channels=128, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dims, feedforward_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(feedforward_channels, embed_dims),
+            nn.Dropout(dropout),
+        )
+        self.norm_q = nn.LayerNorm(embed_dims)
+        self.norm_kv = nn.LayerNorm(embed_dims)
+        self.norm_ffn = nn.LayerNorm(embed_dims)
+
+    def forward(self, query, key=None, value=None):
+        key = query if key is None else key
+        value = key if value is None else value
+
+        attn_query = self.norm_q(query)
+        attn_key = self.norm_kv(key)
+        attn_value = attn_key if value is key else self.norm_kv(value)
+        query = query + self.attn(attn_query, attn_key, attn_value, need_weights=False)[0]
+        query = query + self.ffn(self.norm_ffn(query))
+
+        return query
+
+
 class AdaptiveMixing(nn.Module):
     """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
+                 num_frames=8, temporal_layers=1, temporal_heads=4, dropout=0.1):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
         out_points = out_points if out_points is not None else in_points
         query_dim = query_dim if query_dim is not None else in_dim
+        assert in_points % num_frames == 0
 
         self.query_dim = query_dim
         self.in_dim = in_dim
@@ -332,15 +370,40 @@ class AdaptiveMixing(nn.Module):
         self.n_groups = n_groups
         self.out_dim = out_dim
         self.out_points = out_points
+        self.num_frames = num_frames
+        self.num_points = in_points // num_frames
 
         self.eff_in_dim = in_dim // n_groups
         self.eff_out_dim = out_dim // n_groups
+        assert self.eff_out_dim % temporal_heads == 0
 
         self.m_parameters = self.eff_in_dim * self.eff_out_dim
-        self.s_parameters = self.in_points * self.out_points
-        self.total_parameters = self.m_parameters + self.s_parameters
+        self.total_parameters = self.m_parameters
 
         self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.total_parameters)
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, self.eff_out_dim),
+            nn.LayerNorm(self.eff_out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.eff_out_dim, self.eff_out_dim),
+        )
+        self.point_embedding = nn.Parameter(torch.zeros(self.num_points, self.eff_out_dim))
+        self.temporal_blocks = nn.ModuleList([
+            TransformerMixingBlock(
+                self.eff_out_dim,
+                num_heads=temporal_heads,
+                feedforward_channels=self.eff_out_dim * 2,
+                dropout=dropout,
+            )
+            for _ in range(temporal_layers)
+        ])
+        self.readout_generator = nn.Linear(self.query_dim, self.n_groups * self.out_points * self.eff_out_dim)
+        self.readout_block = TransformerMixingBlock(
+            self.eff_out_dim,
+            num_heads=temporal_heads,
+            feedforward_channels=self.eff_out_dim * 2,
+            dropout=dropout,
+        )
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
@@ -348,30 +411,44 @@ class AdaptiveMixing(nn.Module):
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
 
-    def inner_forward(self, x, query):
+    def inner_forward(self, x, query, time_diff):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
+        assert time_diff.shape[1] == self.num_frames
 
-        '''generate mixing parameters'''
+        '''generate channel mixing parameters'''
         params = self.parameter_generator(query)
         params = params.reshape(B*Q, G, -1)
         out = x.reshape(B*Q, G, P, C)
 
-        M, S = params.split([self.m_parameters, self.s_parameters], 2)
-        M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
-        S = S.reshape(B*Q, G, self.out_points, self.in_points)
+        M = params.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
 
         '''adaptive channel mixing'''
         out = torch.matmul(out, M)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''adaptive point mixing'''
-        out = torch.matmul(S, out)  # implicitly transpose and matmul
-        out = F.layer_norm(out, [out.size(-2), out.size(-1)])
-        out = self.act(out)
+        '''temporal transformer mixing'''
+        out = out.reshape(B, Q, G, self.num_frames, self.num_points, self.eff_out_dim)
+        time_embed = self.time_encoder(time_diff[..., None].to(dtype=out.dtype))
+        out = out + time_embed[:, None, None, :, None, :]
+        out = out + self.point_embedding[None, None, None, None, :, :].to(dtype=out.dtype)
+
+        out = out.permute(0, 1, 2, 4, 3, 5)
+        out = out.reshape(B * Q * G * self.num_points, self.num_frames, self.eff_out_dim)
+        for block in self.temporal_blocks:
+            out = block(out)
+        out = out.reshape(B, Q, G, self.num_points, self.num_frames, self.eff_out_dim)
+        out = out.permute(0, 1, 2, 4, 3, 5).reshape(B, Q, G, P, self.eff_out_dim)
+
+        '''query-guided sampled token readout'''
+        tokens = out.reshape(B * Q * G, P, self.eff_out_dim)
+        readout = self.readout_generator(query)
+        readout = readout.reshape(B, Q, G, self.out_points, self.eff_out_dim)
+        readout = readout.reshape(B * Q * G, self.out_points, self.eff_out_dim)
+        out = self.readout_block(readout, tokens, tokens)
 
         '''linear transfomation to query dim'''
         out = out.reshape(B, Q, -1)
@@ -380,8 +457,8 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def forward(self, x, query):
+    def forward(self, x, query, time_diff):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, use_reentrant=False)
+            return cp(self.inner_forward, x, query, time_diff, use_reentrant=False)
         else:
-            return self.inner_forward(x, query)
+            return self.inner_forward(x, query, time_diff)
