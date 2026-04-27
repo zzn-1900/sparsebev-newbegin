@@ -137,8 +137,14 @@ def main():
             )
         except TypeError:
             model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
-            if hasattr(model, '_set_static_graph'):
-                model._set_static_graph()
+        if not getattr(model, 'static_graph', False):
+            if not hasattr(model, '_set_static_graph'):
+                raise RuntimeError(
+                    'DDP static graph is required for shared decoder params with '
+                    'reentrant mamba checkpointing, but this PyTorch/MMCV DDP '
+                    'wrapper does not expose _set_static_graph().'
+                )
+            model._set_static_graph()
     else:
         model = MMDataParallel(model, [0])
 
