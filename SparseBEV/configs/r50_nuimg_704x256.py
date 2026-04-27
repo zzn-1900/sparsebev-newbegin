@@ -224,13 +224,13 @@ checkpoint_config = dict(interval=1, max_keep_ckpts=1)
 log_config = dict(
     interval=1,
     hooks=[
-        dict(type='MyTextLoggerHook', interval=1, reset_flag=True),
+        dict(type='MyTextLoggerHook', interval=50, reset_flag=True),
         dict(type='MyTensorboardLoggerHook', interval=500, reset_flag=True)
     ]
 )
 
 # evaluation
-eval_config = dict(interval=total_epochs)
+eval_config = dict(interval=1)
 
 # other flags
 debug = False
