@@ -128,7 +128,17 @@ def main():
     logging.info('Batch size per GPU: %d' % (cfgs.batch_size // world_size))
 
     if world_size > 1:
-        model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
+        # The decoder layer is reused across decoder stages. With reentrant
+        # checkpointing in the mamba_ssm path, DDP must know the graph is static
+        # so shared parameters can be marked ready from multiple checkpoints.
+        try:
+            model = MMDistributedDataParallel(
+                model, [local_rank], broadcast_buffers=False, static_graph=True
+            )
+        except TypeError:
+            model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
+            if hasattr(model, '_set_static_graph'):
+                model._set_static_graph()
     else:
         model = MMDataParallel(model, [0])
 

@@ -19,6 +19,7 @@ class SparseBEVTransformer(BaseModule):
     def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4,
                  num_classes=10, code_size=10, pc_range=[],
                  temporal_mixer='linear', mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 mamba_impl='auto',
                  init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
@@ -34,6 +35,7 @@ class SparseBEVTransformer(BaseModule):
             mamba_d_state=mamba_d_state,
             mamba_d_conv=mamba_d_conv,
             mamba_expand=mamba_expand,
+            mamba_impl=mamba_impl,
         )
 
     @torch.no_grad()
@@ -53,6 +55,7 @@ class SparseBEVTransformerDecoder(BaseModule):
     def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4,
                  num_classes=10, code_size=10, pc_range=[],
                  temporal_mixer='linear', mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 mamba_impl='auto',
                  init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
@@ -66,6 +69,7 @@ class SparseBEVTransformerDecoder(BaseModule):
             mamba_d_state=mamba_d_state,
             mamba_d_conv=mamba_d_conv,
             mamba_expand=mamba_expand,
+            mamba_impl=mamba_impl,
         )
 
     @torch.no_grad()
@@ -124,6 +128,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
     def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10,
                  num_cls_fcs=2, num_reg_fcs=2, pc_range=[],
                  temporal_mixer='linear', mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 mamba_impl='auto',
                  init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
@@ -154,6 +159,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
             mamba_d_state=mamba_d_state,
             mamba_d_conv=mamba_d_conv,
             mamba_expand=mamba_expand,
+            mamba_impl=mamba_impl,
         )
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -457,7 +463,8 @@ class AdaptiveMixing(nn.Module):
     """
     def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
                  num_frames=None, num_points=None, temporal_mixer='linear',
-                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2):
+                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 mamba_impl='auto'):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -503,12 +510,35 @@ class AdaptiveMixing(nn.Module):
             # per-group context token derived from query_feat
             self.query_proj = nn.Linear(self.query_dim, self.n_groups * self.eff_out_dim)
 
-            self.mamba = MambaBlock(
-                d_model=self.eff_out_dim,
-                d_state=mamba_d_state,
-                d_conv=mamba_d_conv,
-                expand=mamba_expand,
-            )
+            assert mamba_impl in ['auto', 'ssm', 'torch']
+            self.mamba_impl = mamba_impl
+            self.mamba_uses_custom_autograd = False
+            Mamba = None
+            if mamba_impl in ['auto', 'ssm']:
+                try:
+                    from mamba_ssm import Mamba
+                except ImportError:
+                    if mamba_impl == 'ssm':
+                        raise
+                    Mamba = None
+
+            if Mamba is not None:
+                self.mamba = Mamba(
+                    d_model=self.eff_out_dim,
+                    d_state=mamba_d_state,
+                    d_conv=mamba_d_conv,
+                    expand=mamba_expand,
+                )
+                self.mamba_impl = 'ssm'
+                self.mamba_uses_custom_autograd = True
+            else:
+                self.mamba = MambaBlock(
+                    d_model=self.eff_out_dim,
+                    d_state=mamba_d_state,
+                    d_conv=mamba_d_conv,
+                    expand=mamba_expand,
+                )
+                self.mamba_impl = 'torch'
 
             self.out_proj = nn.Linear(
                 self.eff_out_dim * self.out_p_per_frame * self.n_groups, self.query_dim
@@ -617,6 +647,11 @@ class AdaptiveMixing(nn.Module):
 
     def forward(self, x, query):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, use_reentrant=False)
+            # mamba_ssm's selective_scan saves tensors in its custom backward,
+            # which conflicts with non-reentrant checkpoint saved_tensors_hooks.
+            use_reentrant = (
+                self.temporal_mixer == 'mamba' and self.mamba_uses_custom_autograd
+            )
+            return cp(self.inner_forward, x, query, use_reentrant=use_reentrant)
         else:
             return self.inner_forward(x, query)
