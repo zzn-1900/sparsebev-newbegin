@@ -587,7 +587,7 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def inner_forward_mamba(self, x, query):
+    def inner_forward_mamba_before_mamba(self, x, query):
         B, Q, G, FP, C = x.shape
         F_ = self.num_frames
         P = self.num_points
@@ -630,7 +630,13 @@ class AdaptiveMixing(nn.Module):
         '''causal Mamba scan over the temporal axis (per group, per spatial point)'''
         seq = seq.permute(0, 1, 3, 2, 4).contiguous()                   # [B*Q, G, out_p, F+1, eff_out]
         seq = seq.reshape(B*Q*G*out_p, F_ + 1, eff_out)
-        seq = self.mamba(seq)
+        return seq
+
+    def inner_forward_mamba_after_mamba(self, seq, query):
+        B, Q = query.shape[:2]
+        G = self.n_groups
+        out_p = self.out_p_per_frame
+        eff_out = self.eff_out_dim
 
         '''take the last token (current frame, after history accumulation)'''
         last = seq[:, -1, :].reshape(B, Q, G * out_p * eff_out)
@@ -640,6 +646,26 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
+    def inner_forward_mamba(self, x, query):
+        seq = self.inner_forward_mamba_before_mamba(x, query)
+        seq = self.mamba(seq)
+        return self.inner_forward_mamba_after_mamba(seq, query)
+
+    def checkpointed_forward_mamba_ssm(self, x, query):
+        seq = cp(
+            self.inner_forward_mamba_before_mamba,
+            x,
+            query,
+            use_reentrant=False,
+        )
+        seq = self.mamba(seq)
+        return cp(
+            self.inner_forward_mamba_after_mamba,
+            seq,
+            query,
+            use_reentrant=False,
+        )
+
     def inner_forward(self, x, query):
         if self.temporal_mixer == 'mamba':
             return self.inner_forward_mamba(x, query)
@@ -648,12 +674,11 @@ class AdaptiveMixing(nn.Module):
     def forward(self, x, query):
         if self.training and x.requires_grad:
             if self.temporal_mixer == 'mamba' and self.mamba_uses_custom_autograd:
-                # mamba_ssm's custom backward cannot be wrapped by the
-                # non-reentrant checkpoint implementation here. Reentrant
-                # checkpointing is also unsafe because this decoder layer is
-                # shared across stages under DDP, which can mark the same
-                # parameter ready multiple times in one iteration.
-                return self.inner_forward(x, query)
+                # Keep mamba_ssm itself outside checkpoint because its custom
+                # backward conflicts with non-reentrant saved_tensors_hooks.
+                # The surrounding pure PyTorch work is still checkpointed, and
+                # no reentrant checkpoint touches the shared decoder params.
+                return self.checkpointed_forward_mamba_ssm(x, query)
             return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
             return self.inner_forward(x, query)
