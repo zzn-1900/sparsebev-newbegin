@@ -15,7 +15,10 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4,
+                 num_classes=10, code_size=10, pc_range=[],
+                 temporal_mixer='linear', mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +26,14 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(
+            embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size,
+            pc_range=pc_range,
+            temporal_mixer=temporal_mixer,
+            mamba_d_state=mamba_d_state,
+            mamba_d_conv=mamba_d_conv,
+            mamba_expand=mamba_expand,
+        )
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +49,22 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4,
+                 num_classes=10, code_size=10, pc_range=[],
+                 temporal_mixer='linear', mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size,
+            pc_range=pc_range,
+            temporal_mixer=temporal_mixer,
+            mamba_d_state=mamba_d_state,
+            mamba_d_conv=mamba_d_conv,
+            mamba_expand=mamba_expand,
         )
 
     @torch.no_grad()
@@ -102,7 +120,10 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10,
+                 num_cls_fcs=2, num_reg_fcs=2, pc_range=[],
+                 temporal_mixer='linear', mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -111,7 +132,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         self.pc_range = pc_range
 
         self.position_encoder = nn.Sequential(
-            nn.Linear(3, self.embed_dims), 
+            nn.Linear(3, self.embed_dims),
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims, self.embed_dims),
@@ -121,7 +142,18 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(
+            in_dim=embed_dims,
+            in_points=num_points * num_frames,
+            n_groups=4,
+            out_points=128,
+            num_frames=num_frames,
+            num_points=num_points,
+            temporal_mixer=temporal_mixer,
+            mamba_d_state=mamba_d_state,
+            mamba_d_conv=mamba_d_conv,
+            mamba_expand=mamba_expand,
+        )
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -318,8 +350,16 @@ class SparseBEVSampling(BaseModule):
 
 
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    """Adaptive Mixing with optional Mamba temporal mixer.
+
+    temporal_mixer:
+        'linear' — original AdaMixer-style point mix over flattened F*P axis.
+        'mamba'  — within-frame adaptive point mix + adaptive channel mix, then a causal
+                   Mamba scan along the F axis with query_feat prepended as a context token.
+    """
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
+                 num_frames=None, num_points=None, temporal_mixer='linear',
+                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -332,23 +372,63 @@ class AdaptiveMixing(nn.Module):
         self.n_groups = n_groups
         self.out_dim = out_dim
         self.out_points = out_points
+        self.temporal_mixer = temporal_mixer
 
         self.eff_in_dim = in_dim // n_groups
         self.eff_out_dim = out_dim // n_groups
 
-        self.m_parameters = self.eff_in_dim * self.eff_out_dim
-        self.s_parameters = self.in_points * self.out_points
-        self.total_parameters = self.m_parameters + self.s_parameters
-
-        self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.total_parameters)
-        self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
+
+        if temporal_mixer == 'linear':
+            self.m_parameters = self.eff_in_dim * self.eff_out_dim
+            self.s_parameters = self.in_points * self.out_points
+            self.total_parameters = self.m_parameters + self.s_parameters
+
+            self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.total_parameters)
+            self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
+
+        elif temporal_mixer == 'mamba':
+            assert num_frames is not None and num_points is not None, \
+                'Mamba temporal mixer requires num_frames and num_points'
+            assert in_points == num_frames * num_points
+
+            self.num_frames = num_frames
+            self.num_points = num_points
+            # no within-frame spatial expansion; keep out_p == P to control compute
+            self.out_p_per_frame = num_points
+
+            self.m_parameters = self.eff_in_dim * self.eff_out_dim
+            self.s_parameters = self.out_p_per_frame * self.num_points
+            self.total_parameters = self.m_parameters + self.s_parameters
+
+            self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.total_parameters)
+            # per-group context token derived from query_feat
+            self.query_proj = nn.Linear(self.query_dim, self.n_groups * self.eff_out_dim)
+
+            from mamba_ssm import Mamba
+            self.mamba = Mamba(
+                d_model=self.eff_out_dim,
+                d_state=mamba_d_state,
+                d_conv=mamba_d_conv,
+                expand=mamba_expand,
+            )
+
+            self.out_proj = nn.Linear(
+                self.eff_out_dim * self.out_p_per_frame * self.n_groups, self.query_dim
+            )
+        else:
+            raise ValueError('Unknown temporal_mixer: {}'.format(temporal_mixer))
 
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
+        if self.temporal_mixer == 'mamba':
+            # zero-init residual path so the new module starts as identity w.r.t. query_feat
+            nn.init.zeros_(self.out_proj.weight)
+            if self.out_proj.bias is not None:
+                nn.init.zeros_(self.out_proj.bias)
 
-    def inner_forward(self, x, query):
+    def inner_forward_linear(self, x, query):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
@@ -379,6 +459,64 @@ class AdaptiveMixing(nn.Module):
         out = query + out
 
         return out
+
+    def inner_forward_mamba(self, x, query):
+        B, Q, G, FP, C = x.shape
+        F_ = self.num_frames
+        P = self.num_points
+        out_p = self.out_p_per_frame
+        eff_in = self.eff_in_dim
+        eff_out = self.eff_out_dim
+        assert G == self.n_groups
+        assert FP == F_ * P
+        assert C == eff_in
+
+        # frame 0 is current, F-1 is oldest in the sampled layout;
+        # flip so Mamba scans past -> present and the last token is the current frame
+        x_fp = x.reshape(B, Q, G, F_, P, eff_in)
+        x_fp = torch.flip(x_fp, dims=[3])
+
+        '''generate adaptive params (channel mix M and within-frame point mix S_p)'''
+        params = self.parameter_generator(query)
+        params = params.reshape(B*Q, G, -1)
+        M, S_p = params.split([self.m_parameters, self.s_parameters], 2)
+        M = M.reshape(B*Q, G, eff_in, eff_out)
+        S_p = S_p.reshape(B*Q, G, out_p, P)
+
+        '''within-frame adaptive point mix'''
+        out = x_fp.reshape(B*Q, G, F_, P, eff_in)
+        out = torch.matmul(S_p[:, :, None, :, :], out)  # [B*Q, G, F, out_p, eff_in]
+        out = F.layer_norm(out, [out.size(-2), out.size(-1)])
+        out = self.act(out)
+
+        '''adaptive channel mix'''
+        out = torch.matmul(out, M[:, :, None, :, :])  # [B*Q, G, F, out_p, eff_out]
+        out = F.layer_norm(out, [out.size(-2), out.size(-1)])
+        out = self.act(out)
+
+        '''prepend query token along F as Mamba context'''
+        q_tok = self.query_proj(query)                                  # [B, Q, G*eff_out]
+        q_tok = q_tok.reshape(B*Q, G, 1, 1, eff_out)
+        q_tok = q_tok.expand(B*Q, G, 1, out_p, eff_out)
+        seq = torch.cat([q_tok, out], dim=2)                            # [B*Q, G, F+1, out_p, eff_out]
+
+        '''causal Mamba scan over the temporal axis (per group, per spatial point)'''
+        seq = seq.permute(0, 1, 3, 2, 4).contiguous()                   # [B*Q, G, out_p, F+1, eff_out]
+        seq = seq.reshape(B*Q*G*out_p, F_ + 1, eff_out)
+        seq = self.mamba(seq)
+
+        '''take the last token (current frame, after history accumulation)'''
+        last = seq[:, -1, :].reshape(B, Q, G * out_p * eff_out)
+
+        out = self.out_proj(last)
+        out = query + out
+
+        return out
+
+    def inner_forward(self, x, query):
+        if self.temporal_mixer == 'mamba':
+            return self.inner_forward_mamba(x, query)
+        return self.inner_forward_linear(x, query)
 
     def forward(self, x, query):
         if self.training and x.requires_grad:
