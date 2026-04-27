@@ -128,11 +128,18 @@ def main():
     logging.info('Batch size per GPU: %d' % (cfgs.batch_size // world_size))
 
     if world_size > 1:
-        model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
-        # decoder_layer params are shared across 6 layers and we use reentrant
-        # checkpoint inside AdaptiveMixing (mamba mode) — DDP needs static_graph
-        # to allow the same parameter to be marked ready multiple times.
-        model._set_static_graph()
+        # decoder_layer params are shared across 6 layers and AdaptiveMixing
+        # (mamba mode) uses reentrant checkpoint, so DDP sees the same parameter
+        # marked ready multiple times per iteration. static_graph=True at
+        # construction time lets DDP accept this pattern.
+        try:
+            model = MMDistributedDataParallel(
+                model, [local_rank], broadcast_buffers=False, static_graph=True
+            )
+        except TypeError:
+            # older mmcv that doesn't forward static_graph
+            model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
+            model._set_static_graph()
     else:
         model = MMDataParallel(model, [0])
 
