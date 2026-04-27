@@ -129,6 +129,10 @@ def main():
 
     if world_size > 1:
         model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
+        # decoder_layer params are shared across 6 layers and we use reentrant
+        # checkpoint inside AdaptiveMixing (mamba mode) — DDP needs static_graph
+        # to allow the same parameter to be marked ready multiple times.
+        model._set_static_graph()
     else:
         model = MMDataParallel(model, [0])
 
