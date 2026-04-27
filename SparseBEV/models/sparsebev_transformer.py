@@ -325,10 +325,49 @@ class SparseBEVSampling(BaseModule):
             return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
 
 
+class SDPAAttention(nn.Module):
+    def __init__(self, embed_dims, num_heads=4, dropout=0.1):
+        super().__init__()
+        assert embed_dims % num_heads == 0
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.head_dims = embed_dims // num_heads
+        self.dropout = dropout
+
+        self.q_proj = nn.Linear(embed_dims, embed_dims)
+        self.k_proj = nn.Linear(embed_dims, embed_dims)
+        self.v_proj = nn.Linear(embed_dims, embed_dims)
+        self.out_proj = nn.Linear(embed_dims, embed_dims)
+
+    def forward(self, query, key, value):
+        B, L, _ = query.shape
+        S = key.shape[1]
+
+        q = self.q_proj(query).reshape(B, L, self.num_heads, self.head_dims)
+        k = self.k_proj(key).reshape(B, S, self.num_heads, self.head_dims)
+        v = self.v_proj(value).reshape(B, S, self.num_heads, self.head_dims)
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
+        if hasattr(F, 'scaled_dot_product_attention'):
+            dropout_p = self.dropout if self.training else 0.0
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        else:
+            attn = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dims ** -0.5)
+            attn = torch.softmax(attn, dim=-1)
+            attn = F.dropout(attn, p=self.dropout, training=self.training)
+            out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2).reshape(B, L, self.embed_dims)
+
+        return self.out_proj(out)
+
+
 class TransformerMixingBlock(nn.Module):
     def __init__(self, embed_dims, num_heads=4, feedforward_channels=128, dropout=0.1):
         super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout, batch_first=True)
+        self.attn = SDPAAttention(embed_dims, num_heads, dropout=dropout)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dims, feedforward_channels),
             nn.ReLU(inplace=True),
@@ -347,7 +386,7 @@ class TransformerMixingBlock(nn.Module):
         attn_query = self.norm_q(query)
         attn_key = self.norm_kv(key)
         attn_value = attn_key if value is key else self.norm_kv(value)
-        query = query + self.attn(attn_query, attn_key, attn_value, need_weights=False)[0]
+        query = query + self.attn(attn_query, attn_key, attn_value)
         query = query + self.ffn(self.norm_ffn(query))
 
         return query
