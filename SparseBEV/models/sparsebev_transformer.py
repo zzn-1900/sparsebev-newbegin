@@ -519,6 +519,12 @@ class AdaptiveMixing(nn.Module):
         return self.inner_forward_linear(x, query)
 
     def forward(self, x, query):
+        # Mamba's selective_scan saves model-parameter leaves for its own backward,
+        # which is incompatible with PyTorch's non-reentrant checkpoint
+        # (saved_tensors_hooks). Skip cp for the mamba path — Mamba's CUDA kernel
+        # already implements a memory-efficient backward.
+        if self.temporal_mixer == 'mamba':
+            return self.inner_forward(x, query)
         if self.training and x.requires_grad:
             return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
