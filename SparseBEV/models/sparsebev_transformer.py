@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -349,6 +350,103 @@ class SparseBEVSampling(BaseModule):
             return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
 
 
+class MambaBlock(nn.Module):
+    """Pure-PyTorch causal Mamba block for short sequences.
+
+    Designed to be a drop-in replacement of mamba_ssm.Mamba for the temporal
+    mixer here, where L is small (e.g. F+1=9). Uses standard PyTorch ops only,
+    so backward goes through the regular autograd graph and is fully compatible
+    with non-reentrant gradient checkpointing.
+    """
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
+                 dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = expand * d_model
+        self.dt_rank = max(1, math.ceil(d_model / 16))
+
+        self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
+
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            bias=True,
+        )
+
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        # dt_proj init (Mamba paper): bias such that softplus(bias) ~ U(dt_min, dt_max)
+        dt_init_std = self.dt_rank ** -0.5
+        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp_(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))  # softplus^{-1}
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+
+        # A: real, negative; A_log stored so A = -exp(A_log) is always negative
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).expand(self.d_inner, -1).contiguous()
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.D._no_weight_decay = True
+
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, x):
+        """
+        x: [B, L, d_model]
+        return: [B, L, d_model]
+        """
+        B, L, _ = x.shape
+
+        xz = self.in_proj(x)                                            # [B, L, 2*d_inner]
+        u, z = xz.chunk(2, dim=-1)                                      # each [B, L, d_inner]
+
+        # causal depthwise conv1d (left-causal: pad on both sides, slice first L)
+        u = u.transpose(1, 2)                                           # [B, d_inner, L]
+        u = self.conv1d(u)[..., :L]
+        u = u.transpose(1, 2)                                           # [B, L, d_inner]
+        u = F.silu(u)
+
+        # selective parameters
+        x_dbl = self.x_proj(u)                                          # [B, L, dt_rank+2*d_state]
+        dt_in, B_ssm, C_ssm = x_dbl.split(
+            [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        dt = F.softplus(self.dt_proj(dt_in))                            # [B, L, d_inner]
+
+        # compute A in fp32 for numerical stability of exp, then cast to scan dtype
+        A = (-torch.exp(self.A_log.float())).to(u.dtype)                # [d_inner, d_state]
+
+        # sequential selective scan over L (compute discretization on-the-fly)
+        h = u.new_zeros(B, self.d_inner, self.d_state)
+        ys = []
+        for t in range(L):
+            dt_t = dt[:, t].unsqueeze(-1)                               # [B, d_inner, 1]
+            dA_t = torch.exp(dt_t * A)                                  # [B, d_inner, d_state]
+            dB_x_t = (dt_t * B_ssm[:, t].unsqueeze(1)) * u[:, t].unsqueeze(-1)  # [B, d_inner, d_state]
+            h = dA_t * h + dB_x_t
+            y_t = (h * C_ssm[:, t].unsqueeze(1)).sum(-1)                # [B, d_inner]
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1)                                      # [B, L, d_inner]
+
+        y = y + u * self.D                                              # skip
+        y = y * F.silu(z)                                               # gate
+        y = self.out_proj(y)                                            # [B, L, d_model]
+        return y
+
+
 class AdaptiveMixing(nn.Module):
     """Adaptive Mixing with optional Mamba temporal mixer.
 
@@ -405,8 +503,7 @@ class AdaptiveMixing(nn.Module):
             # per-group context token derived from query_feat
             self.query_proj = nn.Linear(self.query_dim, self.n_groups * self.eff_out_dim)
 
-            from mamba_ssm import Mamba
-            self.mamba = Mamba(
+            self.mamba = MambaBlock(
                 d_model=self.eff_out_dim,
                 d_state=mamba_d_state,
                 d_conv=mamba_d_conv,
@@ -520,11 +617,6 @@ class AdaptiveMixing(nn.Module):
 
     def forward(self, x, query):
         if self.training and x.requires_grad:
-            # Mamba's selective_scan_cuda saves model-parameter leaves for its own
-            # custom backward, which conflicts with non-reentrant checkpoint's
-            # saved_tensors_hooks mechanism. Use reentrant checkpoint for the mamba
-            # path so backward re-runs forward under enable_grad cleanly.
-            use_reentrant = (self.temporal_mixer == 'mamba')
-            return cp(self.inner_forward, x, query, use_reentrant=use_reentrant)
+            return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
             return self.inner_forward(x, query)
