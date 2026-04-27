@@ -647,11 +647,13 @@ class AdaptiveMixing(nn.Module):
 
     def forward(self, x, query):
         if self.training and x.requires_grad:
-            # mamba_ssm's selective_scan saves tensors in its custom backward,
-            # which conflicts with non-reentrant checkpoint saved_tensors_hooks.
-            use_reentrant = (
-                self.temporal_mixer == 'mamba' and self.mamba_uses_custom_autograd
-            )
-            return cp(self.inner_forward, x, query, use_reentrant=use_reentrant)
+            if self.temporal_mixer == 'mamba' and self.mamba_uses_custom_autograd:
+                # mamba_ssm's custom backward cannot be wrapped by the
+                # non-reentrant checkpoint implementation here. Reentrant
+                # checkpointing is also unsafe because this decoder layer is
+                # shared across stages under DDP, which can mark the same
+                # parameter ready multiple times in one iteration.
+                return self.inner_forward(x, query)
+            return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
             return self.inner_forward(x, query)

@@ -128,22 +128,7 @@ def main():
     logging.info('Batch size per GPU: %d' % (cfgs.batch_size // world_size))
 
     if world_size > 1:
-        # The decoder layer is reused across decoder stages. With reentrant
-        # checkpointing in the mamba_ssm path, DDP must know the graph is static
-        # so shared parameters can be marked ready from multiple checkpoints.
-        try:
-            model = MMDistributedDataParallel(
-                model, [local_rank], broadcast_buffers=False, static_graph=True
-            )
-        except TypeError:
-            model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
-        if not hasattr(model, '_set_static_graph'):
-            raise RuntimeError(
-                'DDP static graph is required for shared decoder params with '
-                'reentrant mamba checkpointing, but this PyTorch/MMCV DDP '
-                'wrapper does not expose _set_static_graph().'
-            )
-        model._set_static_graph()
+        model = MMDistributedDataParallel(model, [local_rank], broadcast_buffers=False)
     else:
         model = MMDataParallel(model, [0])
 
