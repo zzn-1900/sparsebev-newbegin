@@ -453,13 +453,88 @@ class MambaBlock(nn.Module):
         return y
 
 
+class TemporalAttentionBlock(nn.Module):
+    """Causal temporal self-attention for short frame sequences.
+
+    PyTorch SDPA dispatches to FlashAttention kernels on supported CUDA builds,
+    and falls back to memory-efficient/math kernels when flash is unavailable.
+    """
+    def __init__(self, d_model, num_heads=4, dropout=0.0):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.dropout = dropout
+
+        self.norm = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.flash_attn_func = None
+        try:
+            from flash_attn import flash_attn_func
+            self.flash_attn_func = flash_attn_func
+        except Exception:
+            pass
+
+    def forward(self, x):
+        """
+        x: [B, L, d_model], ordered from context/history to current frame.
+        return: [B, L, d_model]
+        """
+        B, L, C = x.shape
+        residual = x
+        qkv = self.qkv(self.norm(x))
+        qkv = qkv.reshape(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        dropout_p = self.dropout if self.training else 0.0
+
+        if (
+            self.flash_attn_func is not None
+            and x.is_cuda
+            and q.dtype in (torch.float16, torch.bfloat16)
+        ):
+            out = self.flash_attn_func(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                dropout_p=dropout_p,
+                causal=True,
+            )
+        elif hasattr(F, 'scaled_dot_product_attention'):
+            q = q.transpose(1, 2)  # [B, H, L, D]
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, is_causal=True
+            )
+            out = out.transpose(1, 2)
+        else:
+            q = q.transpose(1, 2)  # [B, H, L, D]
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            attn = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+            causal_mask = torch.ones(L, L, device=x.device, dtype=torch.bool).triu(1)
+            attn = attn.masked_fill(causal_mask, float('-inf'))
+            attn = torch.softmax(attn, dim=-1)
+            if dropout_p > 0:
+                attn = F.dropout(attn, p=dropout_p, training=True)
+            out = torch.matmul(attn, v)
+            out = out.transpose(1, 2)
+
+        out = out.reshape(B, L, C)
+        out = self.out_proj(out)
+        return residual + out
+
+
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing with optional Mamba temporal mixer.
+    """Adaptive Mixing with optional temporal mixer.
 
     temporal_mixer:
         'linear' — original AdaMixer-style point mix over flattened F*P axis.
         'mamba'  — within-frame adaptive point mix + adaptive channel mix, then a causal
                    Mamba scan along the F axis with query_feat prepended as a context token.
+        'attention' — same temporal token layout as 'mamba', using causal self-attention.
     """
     def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
                  num_frames=None, num_points=None, temporal_mixer='linear',
@@ -492,9 +567,9 @@ class AdaptiveMixing(nn.Module):
             self.parameter_generator = nn.Linear(self.query_dim, self.n_groups * self.total_parameters)
             self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
 
-        elif temporal_mixer == 'mamba':
+        elif temporal_mixer in ['mamba', 'attention']:
             assert num_frames is not None and num_points is not None, \
-                'Mamba temporal mixer requires num_frames and num_points'
+                'Temporal mixer requires num_frames and num_points'
             assert in_points == num_frames * num_points
 
             self.num_frames = num_frames
@@ -510,35 +585,41 @@ class AdaptiveMixing(nn.Module):
             # per-group context token derived from query_feat
             self.query_proj = nn.Linear(self.query_dim, self.n_groups * self.eff_out_dim)
 
-            assert mamba_impl in ['auto', 'ssm', 'torch']
+            if temporal_mixer == 'attention':
+                mamba_impl = 'attn'
+            assert mamba_impl in ['auto', 'ssm', 'torch', 'attn']
             self.mamba_impl = mamba_impl
             self.mamba_uses_custom_autograd = False
             Mamba = None
-            if mamba_impl in ['auto', 'ssm']:
-                try:
-                    from mamba_ssm import Mamba
-                except ImportError:
-                    if mamba_impl == 'ssm':
-                        raise
-                    Mamba = None
-
-            if Mamba is not None:
-                self.mamba = Mamba(
-                    d_model=self.eff_out_dim,
-                    d_state=mamba_d_state,
-                    d_conv=mamba_d_conv,
-                    expand=mamba_expand,
-                )
-                self.mamba_impl = 'ssm'
-                self.mamba_uses_custom_autograd = True
+            if mamba_impl == 'attn':
+                self.mamba = TemporalAttentionBlock(d_model=self.eff_out_dim)
+                self.mamba_impl = 'attn'
             else:
-                self.mamba = MambaBlock(
-                    d_model=self.eff_out_dim,
-                    d_state=mamba_d_state,
-                    d_conv=mamba_d_conv,
-                    expand=mamba_expand,
-                )
-                self.mamba_impl = 'torch'
+                if mamba_impl in ['auto', 'ssm']:
+                    try:
+                        from mamba_ssm import Mamba
+                    except ImportError:
+                        if mamba_impl == 'ssm':
+                            raise
+                        Mamba = None
+
+                if Mamba is not None:
+                    self.mamba = Mamba(
+                        d_model=self.eff_out_dim,
+                        d_state=mamba_d_state,
+                        d_conv=mamba_d_conv,
+                        expand=mamba_expand,
+                    )
+                    self.mamba_impl = 'ssm'
+                    self.mamba_uses_custom_autograd = True
+                else:
+                    self.mamba = MambaBlock(
+                        d_model=self.eff_out_dim,
+                        d_state=mamba_d_state,
+                        d_conv=mamba_d_conv,
+                        expand=mamba_expand,
+                    )
+                    self.mamba_impl = 'torch'
 
             self.out_proj = nn.Linear(
                 self.eff_out_dim * self.out_p_per_frame * self.n_groups, self.query_dim
@@ -549,7 +630,7 @@ class AdaptiveMixing(nn.Module):
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
-        if self.temporal_mixer == 'mamba':
+        if self.temporal_mixer in ['mamba', 'attention']:
             # zero-init residual path so the new module starts as identity w.r.t. query_feat
             nn.init.zeros_(self.out_proj.weight)
             if self.out_proj.bias is not None:
@@ -587,7 +668,7 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def inner_forward_mamba_before_mamba(self, x, query):
+    def inner_forward_temporal_before_mixer(self, x, query):
         B, Q, G, FP, C = x.shape
         F_ = self.num_frames
         P = self.num_points
@@ -599,7 +680,7 @@ class AdaptiveMixing(nn.Module):
         assert C == eff_in
 
         # frame 0 is current, F-1 is oldest in the sampled layout;
-        # flip so Mamba scans past -> present and the last token is the current frame
+        # flip so the temporal mixer scans past -> present and the last token is current
         x_fp = x.reshape(B, Q, G, F_, P, eff_in)
         x_fp = torch.flip(x_fp, dims=[3])
 
@@ -621,18 +702,18 @@ class AdaptiveMixing(nn.Module):
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''prepend query token along F as Mamba context'''
+        '''prepend query token along F as temporal context'''
         q_tok = self.query_proj(query)                                  # [B, Q, G*eff_out]
         q_tok = q_tok.reshape(B*Q, G, 1, 1, eff_out)
         q_tok = q_tok.expand(B*Q, G, 1, out_p, eff_out)
         seq = torch.cat([q_tok, out], dim=2)                            # [B*Q, G, F+1, out_p, eff_out]
 
-        '''causal Mamba scan over the temporal axis (per group, per spatial point)'''
+        '''temporal mixing over the time axis (per group, per spatial point)'''
         seq = seq.permute(0, 1, 3, 2, 4).contiguous()                   # [B*Q, G, out_p, F+1, eff_out]
         seq = seq.reshape(B*Q*G*out_p, F_ + 1, eff_out)
         return seq
 
-    def inner_forward_mamba_after_mamba(self, seq, query):
+    def inner_forward_temporal_after_mixer(self, seq, query):
         B, Q = query.shape[:2]
         G = self.n_groups
         out_p = self.out_p_per_frame
@@ -646,29 +727,29 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def inner_forward_mamba(self, x, query):
-        seq = self.inner_forward_mamba_before_mamba(x, query)
+    def inner_forward_temporal(self, x, query):
+        seq = self.inner_forward_temporal_before_mixer(x, query)
         seq = self.mamba(seq)
-        return self.inner_forward_mamba_after_mamba(seq, query)
+        return self.inner_forward_temporal_after_mixer(seq, query)
 
     def checkpointed_forward_mamba_ssm(self, x, query):
         seq = cp(
-            self.inner_forward_mamba_before_mamba,
+            self.inner_forward_temporal_before_mixer,
             x,
             query,
             use_reentrant=False,
         )
         seq = self.mamba(seq)
         return cp(
-            self.inner_forward_mamba_after_mamba,
+            self.inner_forward_temporal_after_mixer,
             seq,
             query,
             use_reentrant=False,
         )
 
     def inner_forward(self, x, query):
-        if self.temporal_mixer == 'mamba':
-            return self.inner_forward_mamba(x, query)
+        if self.temporal_mixer in ['mamba', 'attention']:
+            return self.inner_forward_temporal(x, query)
         return self.inner_forward_linear(x, query)
 
     def forward(self, x, query):
