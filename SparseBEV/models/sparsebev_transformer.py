@@ -427,11 +427,15 @@ class AdaptiveMixing(nn.Module):
             t_emb = t_emb.reshape(B, Q, G, self.num_frames * P_per, self.d_k)
             K = K + t_emb
 
-            # Q_p: in_points learnable probes per group, projected from query
-            Q_p = self.q_proj(query.float()).reshape(B, Q, G, self.in_points, self.d_k)
-            scores = torch.matmul(Q_p, K.transpose(-1, -2)) / (self.d_k ** 0.5)
-            S_attn_latent = torch.softmax(scores, dim=-1)  # [B, Q, G, in_points, in_points]
-            S_attn_latent = S_attn_latent.reshape(B * Q, G, self.in_points, self.in_points)
+            # Q_p: in_points learnable probes per group, projected from query.
+            # SDPA returns softmax(QK^T)V; using identity V gives the attention matrix itself.
+            Q_p = self.q_proj(query.float()).reshape(B * Q, G, self.in_points, self.d_k)
+            K = K.reshape(B * Q, G, self.in_points, self.d_k)
+            eye = torch.eye(self.in_points, dtype=Q_p.dtype, device=Q_p.device)
+            eye = eye.view(1, 1, self.in_points, self.in_points).expand(B * Q, G, -1, -1)
+            S_attn_latent = F.scaled_dot_product_attention(
+                Q_p, K, eye, dropout_p=0.0, is_causal=False
+            )  # [B*Q, G, in_points, in_points]
             S_attn_latent = S_attn_latent.to(S_query.dtype)
 
         # Latent expansion: rewrite the original S via content-aware diffusion of in_points
