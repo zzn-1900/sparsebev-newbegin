@@ -328,11 +328,10 @@ class AdaptiveMixing(nn.Module):
     """Adaptive Mixing with content-aware latent attention.
 
     Augments the original query-only S with a content-conditioned residual:
-        S_final = S_query + alpha * (S_query @ S_attn_latent)
+        S_final = S_query + (S_query @ S_attn_latent)
     where S_attn_latent is a [in_points x in_points] attention obtained from
     softmax(Q_p @ K^T / sqrt(d_k)) with K conditioned on per-point feature,
-    relative sampling offset and frame time. alpha is initialised to zero so that
-    the model starts identical to the original AdaMixer behaviour.
+    relative sampling offset and frame time.
     """
     def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
                  num_frames=8, d_k=16):
@@ -382,14 +381,10 @@ class AdaptiveMixing(nn.Module):
             nn.Linear(d_k, d_k),
         )
 
-        # Residual gate. alpha=0 makes the layer start identical to the original AdaMixer.
-        self.alpha = nn.Parameter(torch.zeros(1))
-
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
-        # Use modest gain so initial S_attn_latent is mildly informative (helps alpha pick up
-        # gradient signal early without disturbing the initial S_query path materially).
+        # Use modest gain so the initial content-aware branch is mild.
         nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
         nn.init.zeros_(self.k_proj.bias)
         nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
@@ -437,7 +432,7 @@ class AdaptiveMixing(nn.Module):
 
         # Latent expansion: rewrite the original S via content-aware diffusion of in_points
         S_attn = torch.matmul(S_query, S_attn_latent)  # [B*Q, G, out_points, in_points]
-        S_final = S_query + self.alpha * S_attn
+        S_final = S_query + S_attn
 
         # ---- adaptive channel mixing ----
         out = torch.matmul(out, M)
