@@ -122,7 +122,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128,
-                                     num_frames=num_frames, pc_range=pc_range)
+                                     num_frames=num_frames)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -168,9 +168,9 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat, sample_xyz = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat, sample_offset = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
         time_diff = img_metas[0]['time_diff']  # [B, F]
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, sample_xyz, time_diff))
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, sample_offset, time_diff))
         query_feat = self.norm3(self.ffn(query_feat))
 
         cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
@@ -279,8 +279,8 @@ class SparseBEVSampling(BaseModule):
 
         # sampling offset of all frames
         sampling_offset = self.sampling_offset(query_feat)
-        sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
-        sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
+        sampling_offset = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
+        sampling_points = make_sample_points(query_bbox, sampling_offset.flatten(2, 3), self.pc_range)  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
@@ -310,10 +310,12 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        # sampling_points: [B, Q, T, G, P, 3] -> [B, Q, G, FP=T*P, 3], matching sampled_feats layout
-        sample_xyz = sampling_points.permute(0, 1, 3, 2, 4, 5).flatten(3, 4)
+        # sampling_offset: [B, Q, G, P, 3] -> [B, Q, G, FP=T*P, 3], matching sampled_feats layout
+        sample_offset = sampling_offset[:, :, None, :, :, :]
+        sample_offset = sample_offset.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
+        sample_offset = sample_offset.permute(0, 1, 3, 2, 4, 5).flatten(3, 4)
 
-        return sampled_feats, sample_xyz
+        return sampled_feats, sample_offset
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -329,11 +331,11 @@ class AdaptiveMixing(nn.Module):
         S_final = S_query + alpha * (S_query @ S_attn_latent)
     where S_attn_latent is a [in_points x in_points] attention obtained from
     softmax(Q_p @ K^T / sqrt(d_k)) with K conditioned on per-point feature,
-    3D sampling position and frame time. alpha is initialised to zero so that
+    relative sampling offset and frame time. alpha is initialised to zero so that
     the model starts identical to the original AdaMixer behaviour.
     """
     def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
-                 num_frames=8, d_k=16, pc_range=None):
+                 num_frames=8, d_k=16):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -365,7 +367,7 @@ class AdaptiveMixing(nn.Module):
         self.k_proj = nn.Linear(self.eff_in_dim, d_k)
         self.q_proj = nn.Linear(self.query_dim, n_groups * self.in_points * d_k)
 
-        # Inject 3D sampling-point coordinates into K.
+        # Inject relative sampling offsets into K.
         self.pos_mlp = nn.Sequential(
             nn.Linear(3, d_k),
             nn.LayerNorm(d_k),
@@ -383,17 +385,6 @@ class AdaptiveMixing(nn.Module):
         # Residual gate. alpha=0 makes the layer start identical to the original AdaMixer.
         self.alpha = nn.Parameter(torch.zeros(1))
 
-        # pc_range is needed to normalise sample_xyz to [-1, 1] before pos_mlp.
-        if pc_range is not None and len(pc_range) == 6:
-            pc = torch.tensor(pc_range, dtype=torch.float32)
-            center = (pc[:3] + pc[3:]) / 2
-            half = (pc[3:] - pc[:3]) / 2
-            self.register_buffer('pos_center', center.view(1, 1, 1, 1, 3), persistent=False)
-            self.register_buffer('pos_half', half.view(1, 1, 1, 1, 3), persistent=False)
-        else:
-            self.pos_center = None
-            self.pos_half = None
-
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
@@ -404,12 +395,12 @@ class AdaptiveMixing(nn.Module):
         nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
         nn.init.zeros_(self.q_proj.bias)
 
-    def inner_forward(self, x, query, sample_xyz, time_diff):
+    def inner_forward(self, x, query, sample_offset, time_diff):
         """
-        x:          [B, Q, G, FP, C_g]   sampled features
-        query:      [B, Q, query_dim]    query embedding
-        sample_xyz: [B, Q, G, FP, 3]     velocity-warped 3D sampling positions
-        time_diff:  [B, F]               per-frame time delta from current frame
+        x:             [B, Q, G, FP, C_g]   sampled features
+        query:         [B, Q, query_dim]    query embedding
+        sample_offset: [B, Q, G, FP, 3]     relative sampling offsets
+        time_diff:     [B, F]               per-frame time delta from current frame
         """
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
@@ -427,10 +418,7 @@ class AdaptiveMixing(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             x_f = x.float()
             K = self.k_proj(x_f)  # [B, Q, G, P, d_k]
-
-            if self.pos_center is not None:
-                xyz = (sample_xyz.float() - self.pos_center) / self.pos_half  # [-1, 1]
-                K = K + self.pos_mlp(xyz)
+            K = K + self.pos_mlp(sample_offset.float())
 
             # time_diff: [B, F] -> per (frame, intra-frame point) embedding
             P_per = self.in_points // self.num_frames  # points per frame, e.g. 4
@@ -465,8 +453,8 @@ class AdaptiveMixing(nn.Module):
         out = self.out_proj(out)
         return query + out
 
-    def forward(self, x, query, sample_xyz, time_diff):
+    def forward(self, x, query, sample_offset, time_diff):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, sample_xyz, time_diff, use_reentrant=False)
+            return cp(self.inner_forward, x, query, sample_offset, time_diff, use_reentrant=False)
         else:
-            return self.inner_forward(x, query, sample_xyz, time_diff)
+            return self.inner_forward(x, query, sample_offset, time_diff)
