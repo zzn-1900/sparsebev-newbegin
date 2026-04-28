@@ -121,7 +121,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128,
+                                     num_frames=num_frames, pc_range=pc_range)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -167,8 +168,9 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
+        sampled_feat, sample_xyz = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        time_diff = img_metas[0]['time_diff']  # [B, F]
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, sample_xyz, time_diff))
         query_feat = self.norm3(self.ffn(query_feat))
 
         cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
@@ -308,7 +310,10 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        return sampled_feats
+        # sampling_points: [B, Q, T, G, P, 3] -> [B, Q, G, FP=T*P, 3], matching sampled_feats layout
+        sample_xyz = sampling_points.permute(0, 1, 3, 2, 4, 5).flatten(3, 4)
+
+        return sampled_feats, sample_xyz
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -318,8 +323,17 @@ class SparseBEVSampling(BaseModule):
 
 
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    """Adaptive Mixing with content-aware latent attention.
+
+    Augments the original query-only S with a content-conditioned residual:
+        S_final = S_query + alpha * (S_query @ S_attn_latent)
+    where S_attn_latent is a [in_points x in_points] attention obtained from
+    softmax(Q_p @ K^T / sqrt(d_k)) with K conditioned on per-point feature,
+    3D sampling position and frame time. alpha is initialised to zero so that
+    the model starts identical to the original AdaMixer behaviour.
+    """
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
+                 num_frames=8, d_k=16, pc_range=None):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -332,6 +346,8 @@ class AdaptiveMixing(nn.Module):
         self.n_groups = n_groups
         self.out_dim = out_dim
         self.out_points = out_points
+        self.num_frames = num_frames
+        self.d_k = d_k
 
         self.eff_in_dim = in_dim // n_groups
         self.eff_out_dim = out_dim // n_groups
@@ -344,44 +360,113 @@ class AdaptiveMixing(nn.Module):
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
+        # Content-aware latent attention: K from features, Q_p from query, both in d_k space.
+        # Latent variant: out_points_attn == in_points, expanded to out_points via S_query.
+        self.k_proj = nn.Linear(self.eff_in_dim, d_k)
+        self.q_proj = nn.Linear(self.query_dim, n_groups * self.in_points * d_k)
+
+        # Inject 3D sampling-point coordinates into K.
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, d_k),
+            nn.LayerNorm(d_k),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_k, d_k),
+        )
+        # Inject per-frame time difference into K so the 32 points carry temporal identity.
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, d_k),
+            nn.LayerNorm(d_k),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_k, d_k),
+        )
+
+        # Residual gate. alpha=0 makes the layer start identical to the original AdaMixer.
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+        # pc_range is needed to normalise sample_xyz to [-1, 1] before pos_mlp.
+        if pc_range is not None and len(pc_range) == 6:
+            pc = torch.tensor(pc_range, dtype=torch.float32)
+            center = (pc[:3] + pc[3:]) / 2
+            half = (pc[3:] - pc[:3]) / 2
+            self.register_buffer('pos_center', center.view(1, 1, 1, 1, 3), persistent=False)
+            self.register_buffer('pos_half', half.view(1, 1, 1, 1, 3), persistent=False)
+        else:
+            self.pos_center = None
+            self.pos_half = None
+
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
+        # Use modest gain so initial S_attn_latent is mildly informative (helps alpha pick up
+        # gradient signal early without disturbing the initial S_query path materially).
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
+        nn.init.zeros_(self.k_proj.bias)
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+        nn.init.zeros_(self.q_proj.bias)
 
-    def inner_forward(self, x, query):
+    def inner_forward(self, x, query, sample_xyz, time_diff):
+        """
+        x:          [B, Q, G, FP, C_g]   sampled features
+        query:      [B, Q, query_dim]    query embedding
+        sample_xyz: [B, Q, G, FP, 3]     velocity-warped 3D sampling positions
+        time_diff:  [B, F]               per-frame time delta from current frame
+        """
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
 
-        '''generate mixing parameters'''
-        params = self.parameter_generator(query)
-        params = params.reshape(B*Q, G, -1)
-        out = x.reshape(B*Q, G, P, C)
-
+        # ---- AdaMixer M / S generated from query ----
+        params = self.parameter_generator(query).reshape(B * Q, G, -1)
+        out = x.reshape(B * Q, G, P, C)
         M, S = params.split([self.m_parameters, self.s_parameters], 2)
-        M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
-        S = S.reshape(B*Q, G, self.out_points, self.in_points)
+        M = M.reshape(B * Q, G, self.eff_in_dim, self.eff_out_dim)
+        S_query = S.reshape(B * Q, G, self.out_points, self.in_points)
 
-        '''adaptive channel mixing'''
+        # ---- Content-aware S_attn (computed in fp32 for softmax stability) ----
+        with torch.cuda.amp.autocast(enabled=False):
+            x_f = x.float()
+            K = self.k_proj(x_f)  # [B, Q, G, P, d_k]
+
+            if self.pos_center is not None:
+                xyz = (sample_xyz.float() - self.pos_center) / self.pos_half  # [-1, 1]
+                K = K + self.pos_mlp(xyz)
+
+            # time_diff: [B, F] -> per (frame, intra-frame point) embedding
+            P_per = self.in_points // self.num_frames  # points per frame, e.g. 4
+            t_emb = self.time_mlp(time_diff.float()[..., None])  # [B, F, d_k]
+            t_emb = t_emb[:, None, None, :, None, :].expand(B, Q, G, self.num_frames, P_per, self.d_k)
+            t_emb = t_emb.reshape(B, Q, G, self.num_frames * P_per, self.d_k)
+            K = K + t_emb
+
+            # Q_p: in_points learnable probes per group, projected from query
+            Q_p = self.q_proj(query.float()).reshape(B, Q, G, self.in_points, self.d_k)
+            scores = torch.matmul(Q_p, K.transpose(-1, -2)) / (self.d_k ** 0.5)
+            S_attn_latent = torch.softmax(scores, dim=-1)  # [B, Q, G, in_points, in_points]
+            S_attn_latent = S_attn_latent.reshape(B * Q, G, self.in_points, self.in_points)
+            S_attn_latent = S_attn_latent.to(S_query.dtype)
+
+        # Latent expansion: rewrite the original S via content-aware diffusion of in_points
+        S_attn = torch.matmul(S_query, S_attn_latent)  # [B*Q, G, out_points, in_points]
+        S_final = S_query + self.alpha * S_attn
+
+        # ---- adaptive channel mixing ----
         out = torch.matmul(out, M)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''adaptive point mixing'''
-        out = torch.matmul(S, out)  # implicitly transpose and matmul
+        # ---- adaptive (now content-aware) point mixing ----
+        out = torch.matmul(S_final, out)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''linear transfomation to query dim'''
+        # ---- back to query dim ----
         out = out.reshape(B, Q, -1)
         out = self.out_proj(out)
-        out = query + out
+        return query + out
 
-        return out
-
-    def forward(self, x, query):
+    def forward(self, x, query, sample_xyz, time_diff):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, use_reentrant=False)
+            return cp(self.inner_forward, x, query, sample_xyz, time_diff, use_reentrant=False)
         else:
-            return self.inner_forward(x, query)
+            return self.inner_forward(x, query, sample_xyz, time_diff)
