@@ -414,8 +414,7 @@ class AdaptiveMixing(nn.Module):
             Q_p = self.q_proj(query.float())
             Q_p = Q_p.reshape(B * Q * G, self.out_points, self.d_k)
             scores = torch.bmm(Q_p, K.transpose(1, 2)).mul_(self.attn_scale)
-            S_attn = torch.softmax(scores, dim=-1)
-            S_attn = S_attn.reshape(B*Q, G, self.out_points, self.in_points)
+            S_attn = scores.reshape(B*Q, G, self.out_points, self.in_points)
             S_attn = S_attn.to(S_query.dtype)
         S_final = S_query + S_attn
 
