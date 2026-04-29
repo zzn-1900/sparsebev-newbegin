@@ -121,7 +121,10 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(
+            in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128,
+            num_frames=num_frames
+        )
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -167,8 +170,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
+        sampled_feat, sample_offset = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, sample_offset))
         query_feat = self.norm3(self.ffn(query_feat))
 
         cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
@@ -277,8 +280,8 @@ class SparseBEVSampling(BaseModule):
 
         # sampling offset of all frames
         sampling_offset = self.sampling_offset(query_feat)
-        sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
-        sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
+        sampling_offset = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
+        sampling_points = make_sample_points(query_bbox, sampling_offset.flatten(2, 3), self.pc_range)  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
@@ -308,7 +311,11 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        return sampled_feats
+        sample_offset = sampling_offset[:, :, :, None, :, :]
+        sample_offset = sample_offset.expand(B, Q, self.num_groups, self.num_frames, self.num_points, 3)
+        sample_offset = sample_offset.flatten(3, 4)  # [B, Q, G, FP, 3]
+
+        return sampled_feats, sample_offset
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -318,8 +325,9 @@ class SparseBEVSampling(BaseModule):
 
 
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    """Adaptive Mixing with direct query-feature probe attention."""
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None,
+                 num_frames=8, d_k=16):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -332,6 +340,12 @@ class AdaptiveMixing(nn.Module):
         self.n_groups = n_groups
         self.out_dim = out_dim
         self.out_points = out_points
+        self.num_frames = num_frames
+        self.d_k = d_k
+        self.attn_scale = d_k ** -0.5
+
+        assert in_points % num_frames == 0
+        assert d_k % 2 == 0
 
         self.eff_in_dim = in_dim // n_groups
         self.eff_out_dim = out_dim // n_groups
@@ -344,15 +358,37 @@ class AdaptiveMixing(nn.Module):
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
+        self.k_proj = nn.Linear(self.eff_in_dim, d_k)
+        self.q_proj = nn.Linear(self.query_dim, n_groups * self.out_points * d_k)
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, d_k),
+            nn.LayerNorm(d_k),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_k, d_k),
+        )
+        time_freq = torch.pow(
+            torch.tensor(10000.0),
+            -torch.arange(d_k // 2, dtype=torch.float32) / (d_k // 2)
+        )
+        frame_id = torch.arange(num_frames, dtype=torch.float32)[:, None]
+        phase = frame_id * time_freq[None, :]
+        time_code = torch.cat([phase.sin(), phase.cos()], dim=-1)
+        self.register_buffer('time_code', time_code, persistent=False)
+
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
+        nn.init.zeros_(self.k_proj.bias)
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+        nn.init.zeros_(self.q_proj.bias)
 
-    def inner_forward(self, x, query):
+    def inner_forward(self, x, query, sample_offset):
         B, Q, G, P, C = x.shape
         assert G == self.n_groups
         assert P == self.in_points
         assert C == self.eff_in_dim
+        assert sample_offset.shape == (B, Q, G, P, 3)
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
@@ -361,7 +397,27 @@ class AdaptiveMixing(nn.Module):
 
         M, S = params.split([self.m_parameters, self.s_parameters], 2)
         M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
-        S = S.reshape(B*Q, G, self.out_points, self.in_points)
+        S_query = S.reshape(B*Q, G, self.out_points, self.in_points)
+
+        '''query-feature probe attention'''
+        with torch.cuda.amp.autocast(enabled=False):
+            x_f = x.float()
+            K = self.k_proj(x_f)
+            K = K + self.pos_mlp(sample_offset.float())
+
+            P_per_frame = self.in_points // self.num_frames
+            time_code = self.time_code.to(device=K.device, dtype=K.dtype)
+            K = K.reshape(B, Q, G, self.num_frames, P_per_frame, self.d_k)
+            K = K + time_code[None, None, None, :, None, :]
+            K = K.reshape(B * Q * G, P, self.d_k)
+
+            Q_p = self.q_proj(query.float())
+            Q_p = Q_p.reshape(B * Q * G, self.out_points, self.d_k)
+            scores = torch.bmm(Q_p, K.transpose(1, 2)).mul_(self.attn_scale)
+            S_attn = torch.softmax(scores, dim=-1)
+            S_attn = S_attn.reshape(B*Q, G, self.out_points, self.in_points)
+            S_attn = S_attn.to(S_query.dtype)
+        S_final = S_query + S_attn
 
         '''adaptive channel mixing'''
         out = torch.matmul(out, M)
@@ -369,7 +425,7 @@ class AdaptiveMixing(nn.Module):
         out = self.act(out)
 
         '''adaptive point mixing'''
-        out = torch.matmul(S, out)  # implicitly transpose and matmul
+        out = torch.matmul(S_final, out)  # implicitly transpose and matmul
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
@@ -380,8 +436,8 @@ class AdaptiveMixing(nn.Module):
 
         return out
 
-    def forward(self, x, query):
+    def forward(self, x, query, sample_offset):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, use_reentrant=False)
+            return cp(self.inner_forward, x, query, sample_offset, use_reentrant=False)
         else:
-            return self.inner_forward(x, query)
+            return self.inner_forward(x, query, sample_offset)
