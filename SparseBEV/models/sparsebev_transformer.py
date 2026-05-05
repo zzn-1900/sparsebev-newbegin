@@ -15,7 +15,9 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10,
+                 code_size=10, pc_range=[], temporal_reweight=None, size_aware_self_attn=False,
+                 size_aware_attn_alpha=0.5, temporal_offset=None, init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,7 +25,11 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(
+            embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size,
+            pc_range=pc_range, temporal_reweight=temporal_reweight,
+            size_aware_self_attn=size_aware_self_attn, size_aware_attn_alpha=size_aware_attn_alpha,
+            temporal_offset=temporal_offset)
 
     @torch.no_grad()
     def init_weights(self):
@@ -39,14 +45,18 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10,
+                 code_size=10, pc_range=[], temporal_reweight=None, size_aware_self_attn=False,
+                 size_aware_attn_alpha=0.5, temporal_offset=None, init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range,
+            temporal_reweight=temporal_reweight, size_aware_self_attn=size_aware_self_attn,
+            size_aware_attn_alpha=size_aware_attn_alpha, temporal_offset=temporal_offset
         )
 
     @torch.no_grad()
@@ -102,7 +112,9 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10,
+                 num_cls_fcs=2, num_reg_fcs=2, pc_range=[], temporal_reweight=None,
+                 size_aware_self_attn=False, size_aware_attn_alpha=0.5, temporal_offset=None, init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -119,8 +131,12 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
             nn.ReLU(inplace=True),
         )
 
-        self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
-        self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.self_attn = SparseBEVSelfAttention(
+            embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range,
+            size_aware=size_aware_self_attn, size_aware_alpha=size_aware_attn_alpha)
+        self.sampling = SparseBEVSampling(
+            embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels,
+            pc_range=pc_range, temporal_reweight=temporal_reweight, temporal_offset=temporal_offset)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -195,9 +211,12 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
 class SparseBEVSelfAttention(BaseModule):
     """Scale-adaptive Self Attention"""
-    def __init__(self, embed_dims=256, num_heads=8, dropout=0.1, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims=256, num_heads=8, dropout=0.1, pc_range=[], size_aware=False,
+                 size_aware_alpha=0.5, init_cfg=None):
         super().__init__(init_cfg)
         self.pc_range = pc_range
+        self.size_aware = size_aware
+        self.size_aware_alpha = size_aware_alpha
 
         self.attention = MultiheadAttention(embed_dims, num_heads, dropout, batch_first=True)
         self.gen_tau = nn.Linear(embed_dims, num_heads)
@@ -235,11 +254,20 @@ class SparseBEVSelfAttention(BaseModule):
 
     @torch.no_grad()
     def calc_bbox_dists(self, bboxes):
-        centers = decode_bbox(bboxes, self.pc_range)[..., :2]  # [B, Q, 2]
+        decoded_bboxes = decode_bbox(bboxes, self.pc_range)
+        centers = decoded_bboxes[..., :2]  # [B, Q, 2]
+
+        if self.size_aware:
+            wh = decoded_bboxes[..., 3:5].clamp(min=1e-2)
+            box_scale = torch.sqrt((wh[..., 0] * wh[..., 1]).clamp(min=1e-2))
+            box_scale = 1.0 + self.size_aware_alpha * torch.log1p(box_scale)
+            box_scale = box_scale.clamp(min=1.0)
 
         dist = []
         for b in range(centers.shape[0]):
             dist_b = torch.norm(centers[b].reshape(-1, 1, 2) - centers[b].reshape(1, -1, 2), dim=-1)
+            if self.size_aware:
+                dist_b = dist_b / box_scale[b].reshape(-1, 1)
             dist.append(dist_b[None, ...])
 
         dist = torch.cat(dist, dim=0)  # [B, Q, Q]
@@ -248,9 +276,47 @@ class SparseBEVSelfAttention(BaseModule):
         return dist
 
 
+class TemporalFeatureReweight(nn.Module):
+    def __init__(self, embed_dims, num_frames, decay=1.5, learnable=True, min_weight=0.05):
+        super().__init__()
+        self.num_frames = num_frames
+        self.decay = max(float(decay), 1e-3)
+        self.learnable = learnable
+        self.min_weight = float(min_weight)
+        self.temporal_bias = nn.Linear(embed_dims, num_frames) if learnable else None
+
+    def init_weights(self):
+        if self.temporal_bias is not None:
+            nn.init.zeros_(self.temporal_bias.weight)
+            nn.init.zeros_(self.temporal_bias.bias)
+
+    def forward(self, sampled_feats, query_feat, time_diff, num_points):
+        B, Q, G, FP, C = sampled_feats.shape
+        if self.num_frames <= 1 or time_diff is None:
+            return sampled_feats
+        if time_diff.shape[1] < self.num_frames or FP != self.num_frames * num_points:
+            return sampled_feats
+
+        frame_dt = time_diff[:, :self.num_frames].abs().to(device=sampled_feats.device)
+        base = torch.exp(-frame_dt.float() / self.decay).clamp_min(self.min_weight)
+        logits = torch.log(base.clamp_min(1e-6))[:, None, :]
+
+        if self.temporal_bias is not None:
+            logits = logits + self.temporal_bias(query_feat).float()
+        else:
+            logits = logits.expand(B, Q, self.num_frames)
+
+        weights = torch.softmax(logits, dim=-1).to(dtype=sampled_feats.dtype) * self.num_frames
+        sampled_feats = sampled_feats.view(B, Q, G, self.num_frames, num_points, C)
+        sampled_feats = sampled_feats * weights[:, :, None, :, None, None]
+
+        return sampled_feats.reshape(B, Q, G, FP, C)
+
+
 class SparseBEVSampling(BaseModule):
     """Adaptive Spatio-temporal Sampling"""
-    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[],
+                 temporal_reweight=None, temporal_offset=None, init_cfg=None):
         super().__init__(init_cfg)
 
         self.num_frames = num_frames
@@ -261,11 +327,49 @@ class SparseBEVSampling(BaseModule):
 
         self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
         self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
+        self.temporal_reweight = self._build_temporal_reweight(embed_dims, temporal_reweight)
+        self.temporal_offset = self._build_temporal_offset(embed_dims, temporal_offset)
+
+    def _build_temporal_reweight(self, embed_dims, temporal_reweight):
+        if temporal_reweight is None:
+            return None
+        if isinstance(temporal_reweight, bool):
+            temporal_reweight = dict(enabled=temporal_reweight)
+        if not temporal_reweight.get('enabled', False):
+            return None
+
+        return TemporalFeatureReweight(
+            embed_dims=embed_dims,
+            num_frames=self.num_frames,
+            decay=temporal_reweight.get('decay', 1.5),
+            learnable=temporal_reweight.get('learnable', True),
+            min_weight=temporal_reweight.get('min_weight', 0.05))
+
+    def _build_temporal_offset(self, embed_dims, temporal_offset):
+        if temporal_offset is None:
+            self.temporal_offset_max = 0.0
+            self.temporal_offset_time_scale = 1.0
+            return None
+        if isinstance(temporal_offset, bool):
+            temporal_offset = dict(enabled=temporal_offset)
+        if not temporal_offset.get('enabled', False):
+            self.temporal_offset_max = 0.0
+            self.temporal_offset_time_scale = 1.0
+            return None
+
+        self.temporal_offset_max = float(temporal_offset.get('max_offset', 0.2))
+        self.temporal_offset_time_scale = max(float(temporal_offset.get('time_scale', 3.0)), 1e-3)
+        return nn.Linear(embed_dims, self.num_groups * self.num_points * 2)
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+        if self.temporal_reweight is not None:
+            self.temporal_reweight.init_weights()
+        if self.temporal_offset is not None:
+            nn.init.zeros_(self.temporal_offset.weight)
+            nn.init.zeros_(self.temporal_offset.bias)
 
     def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         '''
@@ -277,10 +381,27 @@ class SparseBEVSampling(BaseModule):
 
         # sampling offset of all frames
         sampling_offset = self.sampling_offset(query_feat)
-        sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
-        sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
-        sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
-        sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
+        sampling_offset = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
+
+        has_frame_time = img_metas[0]['time_diff'].shape[1] >= self.num_frames
+        if self.temporal_offset is not None and self.num_frames > 1 and has_frame_time:
+            frame_offset_xy = self.temporal_offset(query_feat).view(B, Q, 1, self.num_groups, self.num_points, 2)
+            frame_offset_xy = torch.tanh(frame_offset_xy) * self.temporal_offset_max
+            frame_dt = img_metas[0]['time_diff'][:, :self.num_frames]
+            frame_scale = (frame_dt / self.temporal_offset_time_scale).clamp(-1.0, 1.0)
+            frame_scale = frame_scale[:, None, :, None, None, None]
+            frame_offset_xy = frame_offset_xy * frame_scale
+            frame_offset_z = frame_offset_xy.new_zeros(*frame_offset_xy.shape[:-1], 1)
+            frame_offset = torch.cat([frame_offset_xy, frame_offset_z], dim=-1)
+            sampling_offset = sampling_offset[:, :, None, ...] + frame_offset
+        else:
+            sampling_offset = sampling_offset[:, :, None, ...]
+            sampling_offset = sampling_offset.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
+
+        sampling_points = make_sample_points(
+            query_bbox, sampling_offset.reshape(B, Q, self.num_frames * self.num_groups * self.num_points, 3),
+            self.pc_range)
+        sampling_points = sampling_points.reshape(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
         # warp sample points based on velocity
         time_diff = img_metas[0]['time_diff']  # [B, F]
@@ -307,6 +428,10 @@ class SparseBEVSampling(BaseModule):
             img_metas[0]['lidar2img'],
             image_h, image_w
         )  # [B, Q, G, FP, C]
+
+        if self.temporal_reweight is not None:
+            sampled_feats = self.temporal_reweight(
+                sampled_feats, query_feat, img_metas[0]['time_diff'], self.num_points)
 
         return sampled_feats
 
