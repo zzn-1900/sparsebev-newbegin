@@ -121,7 +121,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
-        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
+        self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128, num_frames=num_frames)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -167,8 +167,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
-        query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
+        sampled_feat, sampling_offset = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        query_feat = self.norm2(self.mixing(sampled_feat, query_feat, sampling_offset))
         query_feat = self.norm3(self.ffn(query_feat))
 
         cls_score = self.cls_branch(query_feat)  # [B, Q, num_classes]
@@ -308,7 +308,12 @@ class SparseBEVSampling(BaseModule):
             image_h, image_w
         )  # [B, Q, G, FP, C]
 
-        return sampled_feats
+        # reshape offset to [B, Q, G, FP, 3] for position encoding in mixing
+        offset_for_mixing = sampling_offset.view(B, Q, self.num_groups, self.num_points, 3)
+        offset_for_mixing = offset_for_mixing.unsqueeze(3).expand(B, Q, self.num_groups, self.num_frames, self.num_points, 3)
+        offset_for_mixing = offset_for_mixing.contiguous().flatten(3, 4)  # [B, Q, G, FP, 3]
+
+        return sampled_feats, offset_for_mixing
 
     def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         if self.training and query_feat.requires_grad:
@@ -318,8 +323,13 @@ class SparseBEVSampling(BaseModule):
 
 
 class AdaptiveMixing(nn.Module):
-    """Adaptive Mixing"""
-    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None):
+    """Adaptive Mixing with Linear Attention supplement.
+
+    Original adaptive mixing generates M and S purely from query, ignoring
+    what was actually sampled. The linear attention branch lets sampled
+    features x participate in the aggregation via content-aware keys.
+    """
+    def __init__(self, in_dim, in_points, n_groups=1, query_dim=None, out_dim=None, out_points=None, num_frames=8):
         super(AdaptiveMixing, self).__init__()
 
         out_dim = out_dim if out_dim is not None else in_dim
@@ -328,12 +338,14 @@ class AdaptiveMixing(nn.Module):
 
         self.query_dim = query_dim
         self.in_dim = in_dim
-        self.in_points = in_points
+        self.in_points = in_points  # FP = num_frames * num_points_per_frame
         self.n_groups = n_groups
         self.out_dim = out_dim
         self.out_points = out_points
+        self.num_frames = num_frames
+        self.num_pts_per_frame = in_points // num_frames  # P = 4
 
-        self.eff_in_dim = in_dim // n_groups
+        self.eff_in_dim = in_dim // n_groups   # C = 64
         self.eff_out_dim = out_dim // n_groups
 
         self.m_parameters = self.eff_in_dim * self.eff_out_dim
@@ -344,44 +356,92 @@ class AdaptiveMixing(nn.Module):
         self.out_proj = nn.Linear(self.eff_out_dim * self.out_points * self.n_groups, self.query_dim)
         self.act = nn.ReLU(inplace=True)
 
+        # linear attention branch
+        d = self.eff_in_dim  # key/query head dim = 64, same as channel dim per group
+        self.q_proj = nn.Linear(query_dim, n_groups * d)
+        self.k_proj = nn.Linear(self.eff_in_dim, d, bias=False)
+        self.v_proj = nn.Linear(self.eff_in_dim, self.eff_in_dim, bias=False)
+        self.offset_embed = nn.Linear(3, d, bias=False)
+        self.time_embed = nn.Embedding(num_frames, d)
+        self.out_proj_lin = nn.Linear(query_dim, query_dim)
+
+        # register frame index buffer once; shape [FP]
+        frame_idx = torch.arange(num_frames).repeat_interleave(self.num_pts_per_frame)
+        self.register_buffer('frame_idx', frame_idx, persistent=False)
+
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.parameter_generator.weight)
+        nn.init.zeros_(self.q_proj.weight)
+        nn.init.zeros_(self.out_proj_lin.weight)
+        nn.init.zeros_(self.out_proj_lin.bias)
 
-    def inner_forward(self, x, query):
-        B, Q, G, P, C = x.shape
-        assert G == self.n_groups
-        assert P == self.in_points
-        assert C == self.eff_in_dim
+    def inner_forward(self, x, query, sampling_offset):
+        """
+        x:               [B, Q, G, FP, C]   C = eff_in_dim
+        query:           [B, Q, query_dim]
+        sampling_offset: [B, Q, G, FP, 3]
+        """
+        B, Q, G, FP, C = x.shape
 
-        '''generate mixing parameters'''
+        # ── original adaptive mixing branch ──────────────────────────────
         params = self.parameter_generator(query)
         params = params.reshape(B*Q, G, -1)
-        out = x.reshape(B*Q, G, P, C)
+        out = x.reshape(B*Q, G, FP, C)
 
         M, S = params.split([self.m_parameters, self.s_parameters], 2)
         M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
-        S = S.reshape(B*Q, G, self.out_points, self.in_points)
+        S = S.reshape(B*Q, G, self.out_points, FP)
 
-        '''adaptive channel mixing'''
         out = torch.matmul(out, M)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''adaptive point mixing'''
-        out = torch.matmul(S, out)  # implicitly transpose and matmul
+        out = torch.matmul(S, out)
         out = F.layer_norm(out, [out.size(-2), out.size(-1)])
         out = self.act(out)
 
-        '''linear transfomation to query dim'''
         out = out.reshape(B, Q, -1)
-        out = self.out_proj(out)
-        out = query + out
+        out = self.out_proj(out)          # [B, Q, query_dim]
 
-        return out
+        # ── linear attention branch ───────────────────────────────────────
+        # q from query: [B, Q, G, 1, d]
+        d = self.eff_in_dim
+        q = self.q_proj(query)                         # [B, Q, G*d]
+        q = q.reshape(B, Q, G, d)                      # [B, Q, G, d]
 
-    def forward(self, x, query):
+        # k from x + spatial offset + temporal embedding
+        k = self.k_proj(x)                             # [B, Q, G, FP, d]
+        k = k + self.offset_embed(sampling_offset)     # [B, Q, G, FP, d]
+        k = k + self.time_embed(self.frame_idx)        # broadcast [FP, d]
+
+        # v from x
+        v = self.v_proj(x)                             # [B, Q, G, FP, C]
+
+        # ELU feature map, non-negative
+        q = F.elu(q) + 1.0                             # [B, Q, G, d]
+        k = F.elu(k) + 1.0                             # [B, Q, G, FP, d]
+
+        # context = φ(k)ᵀ @ v: [B, Q, G, d, C]
+        # einsum avoids explicit transpose and is memory-friendly
+        context = torch.einsum('bqgpd,bqgpc->bqgdc', k, v)
+
+        # out_lin = φ(q) @ context: [B, Q, G, C]
+        out_lin = torch.einsum('bqgd,bqgdc->bqgc', q, context)
+
+        # normalize: divide by φ(q) @ (Σ_p φ(k_p))
+        k_sum = k.sum(dim=3)                           # [B, Q, G, d]
+        denom = (q * k_sum).sum(dim=-1, keepdim=True)  # [B, Q, G, 1]
+        out_lin = out_lin / (denom + 1e-6)             # [B, Q, G, C]
+
+        out_lin = out_lin.reshape(B, Q, G * C)         # [B, Q, query_dim]
+        out_lin = self.out_proj_lin(out_lin)           # [B, Q, query_dim]
+
+        # ── residual ─────────────────────────────────────────────────────
+        return query + out + out_lin
+
+    def forward(self, x, query, sampling_offset):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, query, use_reentrant=False)
+            return cp(self.inner_forward, x, query, sampling_offset, use_reentrant=False)
         else:
-            return self.inner_forward(x, query)
+            return self.inner_forward(x, query, sampling_offset)
