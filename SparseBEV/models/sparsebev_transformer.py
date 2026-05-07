@@ -359,8 +359,11 @@ class AdaptiveMixing(nn.Module):
         # linear attention branch
         d = self.eff_in_dim  # key/query head dim = 64, same as channel dim per group
         self.q_proj = nn.Linear(query_dim, n_groups * d)
-        self.k_proj = nn.Linear(self.eff_in_dim, d, bias=False)
-        self.v_proj = nn.Linear(self.eff_in_dim, self.eff_in_dim, bias=False)
+        # per-group K/V projections: each group has its own [C, d] / [C, C] weight
+        self.k_proj_weight = nn.Parameter(torch.empty(n_groups, self.eff_in_dim, d))
+        self.v_proj_weight = nn.Parameter(torch.empty(n_groups, self.eff_in_dim, self.eff_in_dim))
+        nn.init.xavier_uniform_(self.k_proj_weight)
+        nn.init.xavier_uniform_(self.v_proj_weight)
         self.offset_embed = nn.Linear(3, d, bias=False)
         self.time_embed = nn.Embedding(num_frames, d)
         self.out_proj_lin = nn.Linear(query_dim, query_dim)
@@ -410,13 +413,13 @@ class AdaptiveMixing(nn.Module):
         q = self.q_proj(query)                         # [B, Q, G*d]
         q = q.reshape(B, Q, G, d)                      # [B, Q, G, d]
 
-        # k from x + spatial offset + temporal embedding
-        k = self.k_proj(x)                             # [B, Q, G, FP, d]
+        # k from x + spatial offset + temporal embedding (per-group projection)
+        k = torch.einsum('bqgpc,gcd->bqgpd', x, self.k_proj_weight)  # [B, Q, G, FP, d]
         k = k + self.offset_embed(sampling_offset)     # [B, Q, G, FP, d]
         k = k + self.time_embed(self.frame_idx)        # broadcast [FP, d]
 
-        # v from x
-        v = self.v_proj(x)                             # [B, Q, G, FP, C]
+        # v from x (per-group projection)
+        v = torch.einsum('bqgpc,gcd->bqgpd', x, self.v_proj_weight)  # [B, Q, G, FP, C]
 
         # ELU feature map, non-negative
         q = F.elu(q) + 1.0                             # [B, Q, G, d]
