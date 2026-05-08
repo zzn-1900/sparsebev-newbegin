@@ -8,6 +8,7 @@ from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from .utils import GridMask, pad_multiple, GpuPhotoMetricDistortion
+from .visual_prior_head import VisualPriorHead
 
 
 @DETECTORS.register_module()
@@ -28,7 +29,9 @@ class SparseBEV(MVXTwoStageDetector):
                  img_rpn_head=None,
                  train_cfg=None,
                  test_cfg=None,
-                 pretrained=None):
+                 pretrained=None,
+                 visual_prior_head=None,
+                 vps_feat_level=-1):
         super(SparseBEV, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
                              img_backbone, pts_backbone, img_neck, pts_neck,
@@ -39,6 +42,15 @@ class SparseBEV(MVXTwoStageDetector):
         self.color_aug = GpuPhotoMetricDistortion()
         self.grid_mask = GridMask(ratio=0.5, prob=0.7)
         self.use_grid_mask = True
+
+        # VPS: lightweight visual-prior head over the deepest FPN level (current frame only).
+        # `vps_feat_level` is the index into mlvl_feats; -1 = deepest (smallest spatial).
+        if visual_prior_head is not None:
+            self.visual_prior_head = VisualPriorHead(**visual_prior_head)
+            self.vps_feat_level = vps_feat_level
+        else:
+            self.visual_prior_head = None
+            self.vps_feat_level = vps_feat_level
 
         self.memory = {}
         self.queue = queue.Queue()
@@ -130,6 +142,19 @@ class SparseBEV(MVXTwoStageDetector):
 
         return img_feats_reshaped
 
+    def compute_visual_prior(self, pts_feats):
+        """Compute current-frame VPS prior map from the configured FPN level.
+        pts_feats[lvl]: [B, T*N, C, H, W]
+        Returns: prior_map  [B, N=6, K, H', W']  (current-frame, 6 cameras)
+        """
+        if self.visual_prior_head is None:
+            return None
+        feat = pts_feats[self.vps_feat_level]  # [B, T*N, C, H, W]
+        B, TN, C, H, W = feat.shape
+        # current frame is the first 6 views (loaders/pipelines/loading.py: t=0 first)
+        feat_t0 = feat[:, :6].contiguous()  # [B, N=6, C, H, W]
+        return self.visual_prior_head(feat_t0)
+
     def forward_pts_train(self,
                           pts_feats,
                           gt_bboxes_3d,
@@ -149,7 +174,8 @@ class SparseBEV(MVXTwoStageDetector):
         Returns:
             dict: Losses of each branch.
         """
-        outs = self.pts_bbox_head(pts_feats, img_metas)
+        prior_map = self.compute_visual_prior(pts_feats)
+        outs = self.pts_bbox_head(pts_feats, img_metas, prior_map=prior_map)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
         losses = self.pts_bbox_head.loss(*loss_inputs)
 
@@ -225,7 +251,8 @@ class SparseBEV(MVXTwoStageDetector):
         return self.simple_test(img_metas[0], img[0], **kwargs)
 
     def simple_test_pts(self, x, img_metas, rescale=False):
-        outs = self.pts_bbox_head(x, img_metas)
+        prior_map = self.compute_visual_prior(x)
+        outs = self.pts_bbox_head(x, img_metas, prior_map=prior_map)
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas[0], rescale=rescale)
 
         bbox_results = [

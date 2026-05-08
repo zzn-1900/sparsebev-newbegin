@@ -66,7 +66,7 @@ class SparseBEVHead(DETRHead):
     def init_weights(self):
         self.transformer.init_weights()
 
-    def forward(self, mlvl_feats, img_metas):
+    def forward(self, mlvl_feats, img_metas, prior_map=None):
         query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
         #query_bbox[..., :3] = query_bbox[..., :3].sigmoid()
 
@@ -80,6 +80,7 @@ class SparseBEVHead(DETRHead):
             mlvl_feats,
             attn_mask=attn_mask,
             img_metas=img_metas,
+            prior_map=prior_map,
         )
 
         bbox_preds[..., 0] = bbox_preds[..., 0] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]

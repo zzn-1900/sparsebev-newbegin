@@ -15,7 +15,10 @@ from .csrc.wrapper import MSMV_CUDA
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[],
+                 use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
+                 use_somcts=False, somcts_long_dt=0.5,
+                 init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
         super(SparseBEVTransformer, self).__init__(init_cfg=init_cfg)
@@ -23,14 +26,18 @@ class SparseBEVTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
 
-        self.decoder = SparseBEVTransformerDecoder(embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range)
+        self.decoder = SparseBEVTransformerDecoder(
+            embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range,
+            use_vps=use_vps, vps_channels=vps_channels, vps_patch=vps_patch, vps_fuse_dim=vps_fuse_dim,
+            use_somcts=use_somcts, somcts_long_dt=somcts_long_dt,
+        )
 
     @torch.no_grad()
     def init_weights(self):
         self.decoder.init_weights()
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
-        cls_scores, bbox_preds = self.decoder(query_bbox, query_feat, mlvl_feats, attn_mask, img_metas)
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prior_map=None):
+        cls_scores, bbox_preds = self.decoder(query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prior_map=prior_map)
 
         cls_scores = torch.nan_to_num(cls_scores)
         bbox_preds = torch.nan_to_num(bbox_preds)
@@ -39,21 +46,26 @@ class SparseBEVTransformer(BaseModule):
 
 
 class SparseBEVTransformerDecoder(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[],
+                 use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
+                 use_somcts=False, somcts_long_dt=0.5,
+                 init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
         self.pc_range = pc_range
 
         # params are shared across all decoder layers
         self.decoder_layer = SparseBEVTransformerDecoderLayer(
-            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range
+            embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range,
+            use_vps=use_vps, vps_channels=vps_channels, vps_patch=vps_patch, vps_fuse_dim=vps_fuse_dim,
+            use_somcts=use_somcts, somcts_long_dt=somcts_long_dt,
         )
 
     @torch.no_grad()
     def init_weights(self):
         self.decoder_layer.init_weights()
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prior_map=None):
         cls_scores, bbox_preds = [], []
 
         # calculate time difference according to timestamps
@@ -88,7 +100,8 @@ class SparseBEVTransformerDecoder(BaseModule):
             DUMP.stage_count = i
 
             query_feat, cls_score, bbox_pred = self.decoder_layer(
-                query_bbox, query_feat, mlvl_feats, attn_mask, img_metas
+                query_bbox, query_feat, mlvl_feats, attn_mask, img_metas,
+                prior_map=prior_map,
             )
             query_bbox = bbox_pred.clone().detach()
 
@@ -102,16 +115,20 @@ class SparseBEVTransformerDecoder(BaseModule):
 
 
 class SparseBEVTransformerDecoderLayer(BaseModule):
-    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[],
+                 use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
+                 use_somcts=False, somcts_long_dt=0.5,
+                 init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
         self.num_classes = num_classes
         self.code_size = code_size
         self.pc_range = pc_range
+        self.use_somcts = use_somcts
 
         self.position_encoder = nn.Sequential(
-            nn.Linear(3, self.embed_dims), 
+            nn.Linear(3, self.embed_dims),
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims, self.embed_dims),
@@ -120,7 +137,11 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         )
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
-        self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.sampling = SparseBEVSampling(
+            embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range,
+            use_vps=use_vps, vps_channels=vps_channels, vps_patch=vps_patch, vps_fuse_dim=vps_fuse_dim,
+            use_somcts=use_somcts, somcts_long_dt=somcts_long_dt,
+        )
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -159,15 +180,16 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         return torch.cat([xyz_new, bbox_delta[..., 3:]], dim=-1)
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, prior_map=None):
         """
         query_bbox: [B, Q, 10] [cx, cy, cz, w, h, d, rot.sin, rot.cos, vx, vy]
+        prior_map:  [B, N=6, K, H', W'] (current-frame visual prior, optional)
         """
         query_pos = self.position_encoder(query_bbox[..., :3])
         query_feat = query_feat + query_pos
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
-        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas, prior_map=prior_map)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -250,7 +272,10 @@ class SparseBEVSelfAttention(BaseModule):
 
 class SparseBEVSampling(BaseModule):
     """Adaptive Spatio-temporal Sampling"""
-    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], init_cfg=None):
+    def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[],
+                 use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
+                 use_somcts=False, somcts_long_dt=0.5,
+                 init_cfg=None):
         super().__init__(init_cfg)
 
         self.num_frames = num_frames
@@ -259,35 +284,169 @@ class SparseBEVSampling(BaseModule):
         self.num_levels = num_levels
         self.pc_range = pc_range
 
-        self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
+        # ---- VPS (Visual-Prior Sampling, current-frame only, single-view argmax) ----
+        self.use_vps = use_vps
+        self.vps_channels = vps_channels
+        self.vps_patch = vps_patch
+        self.vps_fuse_dim = vps_fuse_dim
+        if use_vps:
+            # single-view selected by argmax(valid_mask) (same as sampling_4d), append a 1-bit valid flag
+            self.vps_fuse = nn.Linear(vps_channels + 1, vps_fuse_dim)
+            offset_in_dim = embed_dims + vps_fuse_dim
+        else:
+            self.vps_fuse = None
+            offset_in_dim = embed_dims
+
+        # ---- SOMCTS: motion head producing (a_x, a_y, omega) ----
+        self.use_somcts = use_somcts
+        self.somcts_long_dt = somcts_long_dt
+        if use_somcts:
+            self.motion_branch = nn.Linear(embed_dims, 3)
+        else:
+            self.motion_branch = None
+
+        self.sampling_offset = nn.Linear(offset_in_dim, num_groups * num_points * 3)
         self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+        if self.use_vps:
+            nn.init.zeros_(self.vps_fuse.weight)
+            nn.init.zeros_(self.vps_fuse.bias)
+        if self.use_somcts:
+            nn.init.zeros_(self.motion_branch.weight)
+            nn.init.zeros_(self.motion_branch.bias)
 
-    def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
+    def _sample_visual_prior(self, query_bbox, prior_map, lidar2img_t0, image_h, image_w):
+        """
+        Single-view visual-prior sampling (same view-selection convention as sampling_4d).
+
+        query_bbox:    [B, Q, 10]
+        prior_map:     [B, N=6, K, H', W']  (current-frame only)
+        lidar2img_t0:  [B, N=6, 4, 4]       (current-frame projection)
+        image_h/w:     scalar, augmented input image size (for projection normalization)
+        Returns:       [B, Q, vps_fuse_dim]
+        """
+        B, Q = query_bbox.shape[:2]
+        N, K, Hp, Wp = prior_map.shape[1:]
+        eps = 1e-5
+
+        # project query center to all N=6 cameras
+        xyz = decode_bbox(query_bbox, self.pc_range)[..., :3]
+        ones = torch.ones_like(xyz[..., :1])
+        pts = torch.cat([xyz, ones], dim=-1)                          # [B, Q, 4]
+        pts = pts[:, None, :, :, None].expand(B, N, Q, 4, 1)
+        proj = lidar2img_t0[:, :, None, :, :].expand(B, N, Q, 4, 4)
+        cam = torch.matmul(proj, pts).squeeze(-1)                     # [B, N, Q, 4]
+
+        z = cam[..., 2:3]
+        z_safe = torch.maximum(z, torch.full_like(z, eps))
+        uv = cam[..., 0:2] / z_safe
+        u_norm = uv[..., 0] / image_w                                 # [B, N, Q]
+        v_norm = uv[..., 1] / image_h
+        valid = ((z.squeeze(-1) > eps) &
+                 (u_norm > 0) & (u_norm < 1) &
+                 (v_norm > 0) & (v_norm < 1)).float()                 # [B, N, Q]
+
+        # pick a single view per query via argmax (same convention as sampling_4d:102)
+        valid_qn = valid.permute(0, 2, 1)                             # [B, Q, N]
+        sel_view = torch.argmax(valid_qn, dim=-1, keepdim=True)       # [B, Q, 1]
+        sel_valid = valid_qn.gather(-1, sel_view).squeeze(-1)         # [B, Q]
+
+        # build P x P sampling grid in normalized [-1,1] feature-map coords for all views
+        P = self.vps_patch
+        if P > 1:
+            offsets = torch.linspace(-1.0, 1.0, P, device=query_bbox.device)
+            dx = offsets * (1.0 / max(Wp - 1, 1))
+            dy = offsets * (1.0 / max(Hp - 1, 1))
+            grid_y, grid_x = torch.meshgrid(dy, dx, indexing='ij')    # [P, P]
+        else:
+            grid_y = torch.zeros(1, 1, device=query_bbox.device)
+            grid_x = torch.zeros(1, 1, device=query_bbox.device)
+
+        u_g = u_norm * 2.0 - 1.0                                      # [B, N, Q]
+        v_g = v_norm * 2.0 - 1.0
+        u_g = u_g[..., None, None] + grid_x[None, None, None]         # [B, N, Q, P, P]
+        v_g = v_g[..., None, None] + grid_y[None, None, None]
+        grid_all = torch.stack([u_g, v_g], dim=-1)                    # [B, N, Q, P, P, 2]
+
+        # grid_sample on all N views, then gather the chosen view per query
+        feat_in = prior_map.reshape(B * N, K, Hp, Wp)
+        grid_in = grid_all.reshape(B * N, Q * P, P, 2)
+        sampled = F.grid_sample(feat_in, grid_in, mode='bilinear', padding_mode='zeros', align_corners=True)
+        # sampled: [B*N, K, Q*P, P]
+        sampled = sampled.reshape(B, N, K, Q, P, P).mean(dim=(-1, -2))  # [B, N, K, Q]
+        sampled = sampled.permute(0, 3, 1, 2).contiguous()              # [B, Q, N, K]
+
+        # gather the selected view per query
+        sel_idx = sel_view.unsqueeze(-1).expand(B, Q, 1, K)             # [B, Q, 1, K]
+        sampled_sel = sampled.gather(2, sel_idx).squeeze(2)             # [B, Q, K]
+        sampled_sel = sampled_sel * sel_valid.unsqueeze(-1)             # zero-out queries with no valid view
+
+        feat = torch.cat([sampled_sel, sel_valid.unsqueeze(-1)], dim=-1)  # [B, Q, K+1]
+        return self.vps_fuse(feat)                                        # [B, Q, vps_fuse_dim]
+
+    def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas, prior_map=None):
         '''
         query_bbox: [B, Q, 10]
         query_feat: [B, Q, C]
+        prior_map:  [B, N=6, K, H', W']  (current-frame only, optional)
         '''
         B, Q = query_bbox.shape[:2]
         image_h, image_w, _ = img_metas[0]['img_shape'][0]
 
-        # sampling offset of all frames
-        sampling_offset = self.sampling_offset(query_feat)
+        # ---- VPS: condition sampling-offset MLP on current-frame visual prior ----
+        if self.use_vps and prior_map is not None:
+            lidar2img = img_metas[0]['lidar2img']  # [B, T*N, 4, 4]
+            lidar2img_t0 = lidar2img[:, :6]  # current frame is the first 6 views
+            visual_prior = self._sample_visual_prior(query_bbox, prior_map, lidar2img_t0, image_h, image_w)
+            offset_input = torch.cat([query_feat, visual_prior], dim=-1)
+        else:
+            offset_input = query_feat
+
+        sampling_offset = self.sampling_offset(offset_input)
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
         sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
-        sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
+        sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3).clone()
 
-        # warp sample points based on velocity
+        # warp sample points based on velocity (+ optional second-order acceleration & yaw rate)
         time_diff = img_metas[0]['time_diff']  # [B, F]
-        time_diff = time_diff[:, None, :, None]  # [B, 1, F, 1]
-        vel = query_bbox[..., 8:].detach()  # [B, Q, 2]
-        vel = vel[:, :, None, :]  # [B, Q, 1, 2]
-        dist = vel * time_diff  # [B, Q, F, 2]
+        time_diff_b1f1 = time_diff[:, None, :, None]              # [B, 1, F, 1]
+        vel = query_bbox[..., 8:].detach()                        # [B, Q, 2]
+        vel = vel[:, :, None, :]                                  # [B, Q, 1, 2]
+        dist = vel * time_diff_b1f1                               # [B, Q, F, 2] (first order)
+
+        if self.use_somcts:
+            motion = self.motion_branch(query_feat)               # [B, Q, 3] = (a_x, a_y, omega)
+            acc = motion[..., 0:2].detach() if not self.training else motion[..., 0:2]  # [B, Q, 2]
+            omega = motion[..., 2:3].detach() if not self.training else motion[..., 2:3]  # [B, Q, 1]
+
+            dt = time_diff_b1f1                                   # [B, 1, F, 1]
+            long_mask = (dt.abs() > self.somcts_long_dt).float()  # gate: 1 only on long-horizon frames
+            # second-order translational correction: 0.5 * a * dt^2  (sign matches velocity convention)
+            acc_term = 0.5 * acc[:, :, None, :] * (dt ** 2) * long_mask  # [B, Q, F, 2]
+            dist = dist + acc_term
+
+            # yaw-rate correction: rotate sampling-point xy around query center by omega * dt for long-horizon only
+            yaw_delta = (omega[:, :, None, :] * dt * long_mask).squeeze(-1)  # [B, Q, F]
+            cos_y = torch.cos(yaw_delta)[:, :, :, None, None, None]          # [B, Q, F, 1, 1, 1]
+            sin_y = torch.sin(yaw_delta)[:, :, :, None, None, None]
+
+            # rotate sample-point xy in object-relative frame (centered at query xyz)
+            center_xy = decode_bbox(query_bbox, self.pc_range)[..., 0:2]      # [B, Q, 2]
+            center_xy = center_xy[:, :, None, None, None, :]                  # [B, Q, 1, 1, 1, 2]
+            rel_xy = sampling_points[..., 0:2] - center_xy                    # [B, Q, F, G, P, 2]
+            rx = rel_xy[..., 0:1] * cos_y - rel_xy[..., 1:2] * sin_y
+            ry = rel_xy[..., 0:1] * sin_y + rel_xy[..., 1:2] * cos_y
+            rot_xy = torch.cat([rx, ry], dim=-1)                              # [B, Q, F, G, P, 2]
+            sampling_points = torch.cat([
+                center_xy + rot_xy,
+                sampling_points[..., 2:3]
+            ], dim=-1)
+
         dist = dist[:, :, :, None, None, :]  # [B, Q, F, 1, 1, 2]
         sampling_points = torch.cat([
             sampling_points[..., 0:2] - dist,
@@ -310,11 +469,11 @@ class SparseBEVSampling(BaseModule):
 
         return sampled_feats
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
+    def forward(self, query_bbox, query_feat, mlvl_feats, img_metas, prior_map=None):
         if self.training and query_feat.requires_grad:
-            return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
+            return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, prior_map, use_reentrant=False)
         else:
-            return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
+            return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas, prior_map)
 
 
 class AdaptiveMixing(nn.Module):
