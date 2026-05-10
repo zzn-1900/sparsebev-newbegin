@@ -18,6 +18,7 @@ class SparseBEVTransformer(BaseModule):
     def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[],
                  use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
                  use_somcts=False, somcts_long_dt=0.5,
+                 somcts_a_max=5.0, somcts_omega_max=1.0,
                  init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
@@ -30,6 +31,7 @@ class SparseBEVTransformer(BaseModule):
             embed_dims, num_frames, num_points, num_layers, num_levels, num_classes, code_size, pc_range=pc_range,
             use_vps=use_vps, vps_channels=vps_channels, vps_patch=vps_patch, vps_fuse_dim=vps_fuse_dim,
             use_somcts=use_somcts, somcts_long_dt=somcts_long_dt,
+            somcts_a_max=somcts_a_max, somcts_omega_max=somcts_omega_max,
         )
 
     @torch.no_grad()
@@ -49,6 +51,7 @@ class SparseBEVTransformerDecoder(BaseModule):
     def __init__(self, embed_dims, num_frames=8, num_points=4, num_layers=6, num_levels=4, num_classes=10, code_size=10, pc_range=[],
                  use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
                  use_somcts=False, somcts_long_dt=0.5,
+                 somcts_a_max=5.0, somcts_omega_max=1.0,
                  init_cfg=None):
         super(SparseBEVTransformerDecoder, self).__init__(init_cfg)
         self.num_layers = num_layers
@@ -59,6 +62,7 @@ class SparseBEVTransformerDecoder(BaseModule):
             embed_dims, num_frames, num_points, num_levels, num_classes, code_size, pc_range=pc_range,
             use_vps=use_vps, vps_channels=vps_channels, vps_patch=vps_patch, vps_fuse_dim=vps_fuse_dim,
             use_somcts=use_somcts, somcts_long_dt=somcts_long_dt,
+            somcts_a_max=somcts_a_max, somcts_omega_max=somcts_omega_max,
         )
 
     @torch.no_grad()
@@ -118,6 +122,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
     def __init__(self, embed_dims, num_frames=8, num_points=4, num_levels=4, num_classes=10, code_size=10, num_cls_fcs=2, num_reg_fcs=2, pc_range=[],
                  use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
                  use_somcts=False, somcts_long_dt=0.5,
+                 somcts_a_max=5.0, somcts_omega_max=1.0,
                  init_cfg=None):
         super(SparseBEVTransformerDecoderLayer, self).__init__(init_cfg)
 
@@ -141,6 +146,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
             embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range,
             use_vps=use_vps, vps_channels=vps_channels, vps_patch=vps_patch, vps_fuse_dim=vps_fuse_dim,
             use_somcts=use_somcts, somcts_long_dt=somcts_long_dt,
+            somcts_a_max=somcts_a_max, somcts_omega_max=somcts_omega_max,
         )
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
@@ -275,6 +281,7 @@ class SparseBEVSampling(BaseModule):
     def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[],
                  use_vps=False, vps_channels=32, vps_patch=3, vps_fuse_dim=64,
                  use_somcts=False, somcts_long_dt=0.5,
+                 somcts_a_max=5.0, somcts_omega_max=1.0,
                  init_cfg=None):
         super().__init__(init_cfg)
 
@@ -292,30 +299,43 @@ class SparseBEVSampling(BaseModule):
         if use_vps:
             # single-view selected by argmax(valid_mask) (same as sampling_4d), append a 1-bit valid flag
             self.vps_fuse = nn.Linear(vps_channels + 1, vps_fuse_dim)
-            offset_in_dim = embed_dims + vps_fuse_dim
+            # residual offset path: keeps gradient flowing into vps_fuse / VisualPriorHead
+            # even when sampling_offset.weight is zero-initialized (R1 fix)
+            self.vps_offset_delta = nn.Linear(vps_fuse_dim, num_groups * num_points * 3)
+            sw_in_dim = embed_dims + vps_fuse_dim
         else:
             self.vps_fuse = None
-            offset_in_dim = embed_dims
+            self.vps_offset_delta = None
+            sw_in_dim = embed_dims
 
         # ---- SOMCTS: motion head producing (a_x, a_y, omega) ----
         self.use_somcts = use_somcts
         self.somcts_long_dt = somcts_long_dt
+        self.somcts_a_max = somcts_a_max
+        self.somcts_omega_max = somcts_omega_max
         if use_somcts:
             self.motion_branch = nn.Linear(embed_dims, 3)
         else:
             self.motion_branch = None
 
-        self.sampling_offset = nn.Linear(offset_in_dim, num_groups * num_points * 3)
-        self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
+        # baseline path — unchanged from original SparseBEV (zero-init weight + uniform bias)
+        self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
+        # scale_weights now also conditioned on visual_prior when VPS is on (R4 fix)
+        self.scale_weights = nn.Linear(sw_in_dim, num_groups * num_points * num_levels)
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
         nn.init.zeros_(self.sampling_offset.weight)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
         if self.use_vps:
-            nn.init.zeros_(self.vps_fuse.weight)
+            # non-zero init — breaks the zero-init deadlock that previously starved
+            # vps_fuse / VisualPriorHead of gradient (R1 fix)
+            nn.init.xavier_uniform_(self.vps_fuse.weight)
             nn.init.zeros_(self.vps_fuse.bias)
+            nn.init.xavier_uniform_(self.vps_offset_delta.weight, gain=0.01)
+            nn.init.zeros_(self.vps_offset_delta.bias)
         if self.use_somcts:
+            # tanh(0)=0 keeps soft-start: motion=0 at iter 0, equivalent to first-order baseline
             nn.init.zeros_(self.motion_branch.weight)
             nn.init.zeros_(self.motion_branch.bias)
 
@@ -397,16 +417,21 @@ class SparseBEVSampling(BaseModule):
         B, Q = query_bbox.shape[:2]
         image_h, image_w, _ = img_metas[0]['img_shape'][0]
 
-        # ---- VPS: condition sampling-offset MLP on current-frame visual prior ----
+        # ---- VPS: compute visual_prior once, reused for sampling_offset (residual)
+        # and scale_weights (concat). Residual injection avoids the zero-init deadlock
+        # caused by sampling_offset.weight=0 starving downstream visual prior gradient.
+        visual_prior = None
         if self.use_vps and prior_map is not None:
             lidar2img = img_metas[0]['lidar2img']  # [B, T*N, 4, 4]
             lidar2img_t0 = lidar2img[:, :6]  # current frame is the first 6 views
             visual_prior = self._sample_visual_prior(query_bbox, prior_map, lidar2img_t0, image_h, image_w)
-            offset_input = torch.cat([query_feat, visual_prior], dim=-1)
-        else:
-            offset_input = query_feat
 
-        sampling_offset = self.sampling_offset(offset_input)
+        # baseline path (zero-init weight + uniform bias, identical to original SparseBEV)
+        sampling_offset = self.sampling_offset(query_feat)
+        if visual_prior is not None:
+            # additive residual: vps_offset_delta is non-zero-initialized so gradient
+            # reaches vps_fuse / VisualPriorHead from iter 0
+            sampling_offset = sampling_offset + self.vps_offset_delta(visual_prior)
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
         sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
@@ -420,18 +445,24 @@ class SparseBEVSampling(BaseModule):
         dist = vel * time_diff_b1f1                               # [B, Q, F, 2] (first order)
 
         if self.use_somcts:
-            motion = self.motion_branch(query_feat)               # [B, Q, 3] = (a_x, a_y, omega)
+            motion_raw = self.motion_branch(query_feat)           # [B, Q, 3] = (a_x, a_y, omega) raw logits
+            # bound motion to physically plausible range: |a| <= a_max, |omega| <= omega_max
+            # tanh(0)=0 preserves soft-start (motion=0 at iter 0 -> first-order baseline)
+            motion = torch.cat([
+                self.somcts_a_max * torch.tanh(motion_raw[..., 0:2]),
+                self.somcts_omega_max * torch.tanh(motion_raw[..., 2:3]),
+            ], dim=-1)
             acc = motion[..., 0:2].detach() if not self.training else motion[..., 0:2]  # [B, Q, 2]
             omega = motion[..., 2:3].detach() if not self.training else motion[..., 2:3]  # [B, Q, 1]
 
             dt = time_diff_b1f1                                   # [B, 1, F, 1]
             long_mask = (dt.abs() > self.somcts_long_dt).float()  # gate: 1 only on long-horizon frames
-            # second-order translational correction: 0.5 * a * dt^2  (sign matches velocity convention)
+            # backward Taylor: pts_past = pts_now - v*dt + 0.5*a*dt^2 ; pts <- pts - dist
             acc_term = 0.5 * acc[:, :, None, :] * (dt ** 2) * long_mask  # [B, Q, F, 2]
-            dist = dist + acc_term
+            dist = dist - acc_term
 
-            # yaw-rate correction: rotate sampling-point xy around query center by omega * dt for long-horizon only
-            yaw_delta = (omega[:, :, None, :] * dt * long_mask).squeeze(-1)  # [B, Q, F]
+            # backward yaw: yaw_past = yaw_now - omega*dt -> rel_xy_past = R(-omega*dt) * rel_xy_now
+            yaw_delta = (-omega[:, :, None, :] * dt * long_mask).squeeze(-1)  # [B, Q, F]
             cos_y = torch.cos(yaw_delta)[:, :, :, None, None, None]          # [B, Q, F, 1, 1, 1]
             sin_y = torch.sin(yaw_delta)[:, :, :, None, None, None]
 
@@ -453,8 +484,12 @@ class SparseBEVSampling(BaseModule):
             sampling_points[..., 2:3]
         ], dim=-1)
 
-        # scale weights
-        scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
+        # scale weights — also conditioned on visual_prior when VPS is active (R4 fix)
+        if visual_prior is not None:
+            sw_input = torch.cat([query_feat, visual_prior], dim=-1)
+        else:
+            sw_input = query_feat
+        scale_weights = self.scale_weights(sw_input).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
         scale_weights = torch.softmax(scale_weights, dim=-1)
         scale_weights = scale_weights.expand(B, Q, self.num_groups, self.num_frames, self.num_points, self.num_levels)
 

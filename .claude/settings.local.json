@@ -4,7 +4,10 @@
       "Bash(Get-ChildItem -Recurse -Directory)",
       "Bash(Select-Object -ExpandProperty FullName)",
       "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\), filename=f\\) for f in ['models/sparsebev_transformer.py', 'models/sparsebev.py', 'models/sparsebev_head.py', 'models/visual_prior_head.py', 'configs/r50_nuimg_704x256.py']]; print\\('OK: all files parse'\\)\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(git -C \"C:/Users/zzn/Desktop/sparsebev-newbegin\" status)",
+      "Bash(git diff *)",
+      "Read(//tmp/**)"
     ]
   }
 }
