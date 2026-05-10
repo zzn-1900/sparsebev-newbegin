@@ -34,11 +34,13 @@ use_vps = True
 vps_channels = 32
 vps_patch = 3
 vps_fuse_dim = 64
-vps_extra_pool = 2  # extra avg-pool over deepest FPN level (1/32 -> 1/64)
+vps_extra_pool = 1  # keep deepest FPN at 1/32 (8x22) — was 2, lowered to preserve spatial detail
 
 # SOMCTS: Second-Order Motion-Compensated Temporal Sampling
 use_somcts = True
-somcts_long_dt = 1            # |dt| > 0.5s -> apply 2nd-order correction
+somcts_long_dt = 1            # |dt| > 1.0s -> apply 2nd-order correction
+somcts_a_max = 5.0            # |a| <= 5 m/s^2 (tanh-bounded)
+somcts_omega_max = 1.0        # |omega| <= 1 rad/s (tanh-bounded)
 
 img_backbone = dict(
     type='ResNet',
@@ -101,6 +103,8 @@ model = dict(
             vps_fuse_dim=vps_fuse_dim,
             use_somcts=use_somcts,
             somcts_long_dt=somcts_long_dt,
+            somcts_a_max=somcts_a_max,
+            somcts_omega_max=somcts_omega_max,
         ),
         bbox_coder=dict(
             type='NMSFreeCoder',
@@ -250,12 +254,12 @@ log_config = dict(
     interval=1,
     hooks=[
         dict(type='MyTextLoggerHook', interval=1, reset_flag=True),
-        dict(type='MyTensorboardLoggerHook', interval=500, reset_flag=True)
+        dict(type='MyTensorboardLoggerHook', interval=50, reset_flag=True)
     ]
 )
 
 # evaluation
-eval_config = dict(interval=total_epochs)
+eval_config = dict(interval=5)
 
 # other flags
 debug = False
