@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.google.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:duckduckgo.com)",
+      "WebFetch(domain:www.bing.com)",
+      "WebFetch(domain:scholar.google.com)",
+      "WebFetch(domain:www.semanticscholar.org)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('models/sparsebev_sampling.py'\\).read\\(\\)\\); ast.parse\\(open\\('models/sparsebev_transformer.py'\\).read\\(\\)\\); print\\('OK: syntax valid'\\)\")"
+    ]
+  }
+}

@@ -8,7 +8,7 @@ from mmcv.cnn.bricks.transformer import MultiheadAttention, FFN
 from mmdet.models.utils.builder import TRANSFORMER
 from .bbox.utils import decode_bbox
 from .utils import inverse_sigmoid, DUMP
-from .sparsebev_sampling import sampling_4d, make_sample_points
+from .sparsebev_sampling import sampling_4d, make_sample_points, make_probe_points
 from .checkpoint import checkpoint as cp
 from .csrc.wrapper import MSMV_CUDA
 
@@ -249,7 +249,7 @@ class SparseBEVSelfAttention(BaseModule):
 
 
 class SparseBEVSampling(BaseModule):
-    """Adaptive Spatio-temporal Sampling"""
+    """Adaptive Spatio-temporal Sampling with Content-Aware (Probe-Augmented) Offset Prediction"""
     def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], init_cfg=None):
         super().__init__(init_cfg)
 
@@ -257,10 +257,12 @@ class SparseBEVSampling(BaseModule):
         self.num_points = num_points
         self.num_groups = num_groups
         self.num_levels = num_levels
+        self.num_probe = 5  # BEV 4 corners + center
         self.pc_range = pc_range
 
-        self.sampling_offset = nn.Linear(embed_dims, num_groups * num_points * 3)
-        self.scale_weights = nn.Linear(embed_dims, num_groups * num_points * num_levels)
+        # NOTE: input dim is embed_dims * 2 due to concat(query_feat, probe_feat)
+        self.sampling_offset = nn.Linear(embed_dims * 2, num_groups * num_points * 3)
+        self.scale_weights = nn.Linear(embed_dims * 2, num_groups * num_points * num_levels)
 
     def init_weights(self):
         bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
@@ -275,8 +277,38 @@ class SparseBEVSampling(BaseModule):
         B, Q = query_bbox.shape[:2]
         image_h, image_w, _ = img_metas[0]['img_shape'][0]
 
+        # ==================== Probe Sampling ====================
+        # Inject fresh image content at the CURRENT (refined) query_bbox
+        # location before predicting sampling offsets, closing the
+        # feature-staleness gap between decoder layers.
+        probe_points = make_probe_points(query_bbox, self.pc_range)  # [B, Q, 5, 3]
+        probe_points = probe_points.reshape(B, Q, 1, 1, self.num_probe, 3)
+        probe_points = probe_points.expand(B, Q, self.num_frames, self.num_groups, self.num_probe, 3)
+        probe_points = probe_points.contiguous()
+
+        # uniform FPN weights for probe (no scale learning needed)
+        probe_weights = query_bbox.new_ones(
+            B, Q, self.num_groups, self.num_frames, self.num_probe, self.num_levels
+        ) / self.num_levels
+
+        probe_feat = sampling_4d(
+            probe_points,
+            mlvl_feats,
+            probe_weights,
+            img_metas[0]['lidar2img'],
+            image_h, image_w
+        )  # [B, Q, G, T*5, C_per_group]
+
+        # aggregate over time and probe points -> per-group descriptor
+        probe_feat = probe_feat.mean(dim=3)                # [B, Q, G, C_per_group]
+        probe_feat = probe_feat.reshape(B, Q, -1).detach() # [B, Q, G*C_per_group = embed_dims]
+
+        # condition offset / scale prediction on both query state and fresh image content
+        cond_feat = torch.cat([query_feat, probe_feat], dim=-1)  # [B, Q, 2*embed_dims]
+
+        # ==================== Main Sampling ====================
         # sampling offset of all frames
-        sampling_offset = self.sampling_offset(query_feat)
+        sampling_offset = self.sampling_offset(cond_feat)
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
         sampling_points = make_sample_points(query_bbox, sampling_offset, self.pc_range)  # [B, Q, GP, 3]
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
@@ -295,7 +327,7 @@ class SparseBEVSampling(BaseModule):
         ], dim=-1)
 
         # scale weights
-        scale_weights = self.scale_weights(query_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
+        scale_weights = self.scale_weights(cond_feat).view(B, Q, self.num_groups, 1, self.num_points, self.num_levels)
         scale_weights = torch.softmax(scale_weights, dim=-1)
         scale_weights = scale_weights.expand(B, Q, self.num_groups, self.num_frames, self.num_points, self.num_levels)
 

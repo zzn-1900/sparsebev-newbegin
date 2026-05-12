@@ -24,6 +24,37 @@ def make_sample_points(query_bbox, offset, pc_range):
     return sample_xyz  # [B, Q, P, 3]
 
 
+def make_probe_points(query_bbox, pc_range):
+    '''
+    Generate fixed geometric probe points at the current query_bbox location.
+    Used to inject fresh image content into offset prediction, addressing
+    the feature-staleness problem in the decoder.
+
+    query_bbox: [B, Q, 10]
+    Returns probe_xyz: [B, Q, 5, 3]  (center + 4 BEV corners at z-center)
+    '''
+    query_bbox = decode_bbox(query_bbox, pc_range)  # [B, Q, 9]
+
+    xyz = query_bbox[..., 0:3]  # [B, Q, 3]
+    wlh = query_bbox[..., 3:6]  # [B, Q, 3]
+    ang = query_bbox[..., 6:7]  # [B, Q, 1]
+
+    # 5 fixed offsets in normalized bbox-local space (BEV plane only)
+    probe_offsets = torch.tensor([
+        [ 0.0,  0.0, 0.0],   # center
+        [ 0.5,  0.5, 0.0],   # front-right
+        [-0.5,  0.5, 0.0],   # front-left
+        [-0.5, -0.5, 0.0],   # rear-left
+        [ 0.5, -0.5, 0.0],   # rear-right
+    ], dtype=xyz.dtype, device=xyz.device)  # [5, 3]
+
+    delta_xyz = probe_offsets[None, None, :, :] * wlh[:, :, None, :]  # [B, Q, 5, 3]
+    delta_xyz = rotation_3d_in_axis(delta_xyz, ang)  # rotate into bbox frame
+    probe_xyz = xyz[:, :, None, :] + delta_xyz  # [B, Q, 5, 3]
+
+    return probe_xyz
+
+
 def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, image_w, eps=1e-5):
     """
     Args:
