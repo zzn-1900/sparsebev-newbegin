@@ -249,25 +249,36 @@ class SparseBEVSelfAttention(BaseModule):
 
 
 class SparseBEVSampling(BaseModule):
-    """Adaptive Spatio-temporal Sampling with Content-Aware (Probe-Augmented) Offset Prediction"""
+    """Adaptive Spatio-temporal Sampling with Current-Frame Group-Probe Offset Prediction"""
     def __init__(self, embed_dims=256, num_frames=4, num_groups=4, num_points=8, num_levels=4, pc_range=[], init_cfg=None):
         super().__init__(init_cfg)
 
+        assert embed_dims % num_groups == 0
         self.num_frames = num_frames
         self.num_points = num_points
         self.num_groups = num_groups
         self.num_levels = num_levels
         self.num_probe = 5  # BEV 4 corners + center
+        self.group_dims = embed_dims // num_groups
+        self.group_cond_dims = embed_dims + self.num_probe * self.group_dims
         self.pc_range = pc_range
 
-        # NOTE: input dim is embed_dims * 2 due to concat(query_feat, probe_feat)
-        self.sampling_offset = nn.Linear(embed_dims * 2, num_groups * num_points * 3)
-        self.scale_weights = nn.Linear(embed_dims * 2, num_groups * num_points * num_levels)
+        self.sampling_offset = nn.Linear(self.group_cond_dims, num_points * 3)
+        self.scale_weights = nn.Linear(self.group_cond_dims, num_points * num_levels)
 
     def init_weights(self):
-        bias = self.sampling_offset.bias.data.view(self.num_groups * self.num_points, 3)
-        nn.init.zeros_(self.sampling_offset.weight)
+        bias = self.sampling_offset.bias.data.view(self.num_points, 3)
+        nn.init.xavier_uniform_(self.sampling_offset.weight, gain=0.1)
         nn.init.uniform_(bias[:, 0:3], -0.5, 0.5)
+
+    def _select_current_frame_feats(self, mlvl_feats, batch_size):
+        current_feats = []
+        for feat in mlvl_feats:
+            num_frames = feat.shape[0] // (batch_size * self.num_groups)
+            feat = feat.reshape(batch_size, num_frames, self.num_groups, *feat.shape[1:])
+            feat = feat[:, 0].reshape(batch_size * self.num_groups, *feat.shape[3:])
+            current_feats.append(feat.contiguous())
+        return current_feats
 
     def inner_forward(self, query_bbox, query_feat, mlvl_feats, img_metas):
         '''
@@ -278,33 +289,33 @@ class SparseBEVSampling(BaseModule):
         image_h, image_w, _ = img_metas[0]['img_shape'][0]
 
         # ==================== Probe Sampling ====================
-        # Inject fresh image content at the CURRENT (refined) query_bbox
-        # location before predicting sampling offsets, closing the
-        # feature-staleness gap between decoder layers.
+        # Inject fresh current-frame image content at the refined query_bbox
+        # location before predicting sampling offsets.
         probe_points = make_probe_points(query_bbox, self.pc_range)  # [B, Q, 5, 3]
         probe_points = probe_points.reshape(B, Q, 1, 1, self.num_probe, 3)
-        probe_points = probe_points.expand(B, Q, self.num_frames, self.num_groups, self.num_probe, 3)
+        probe_points = probe_points.expand(B, Q, 1, self.num_groups, self.num_probe, 3)
         probe_points = probe_points.contiguous()
 
         # uniform FPN weights for probe (no scale learning needed)
         probe_weights = query_bbox.new_ones(
-            B, Q, self.num_groups, self.num_frames, self.num_probe, self.num_levels
+            B, Q, self.num_groups, 1, self.num_probe, self.num_levels
         ) / self.num_levels
+        probe_mlvl_feats = self._select_current_frame_feats(mlvl_feats, B)
+        probe_lidar2img = img_metas[0]['lidar2img'][:, :6]
 
         probe_feat = sampling_4d(
             probe_points,
-            mlvl_feats,
+            probe_mlvl_feats,
             probe_weights,
-            img_metas[0]['lidar2img'],
+            probe_lidar2img,
             image_h, image_w
-        )  # [B, Q, G, T*5, C_per_group]
+        )  # [B, Q, G, 5, C_per_group]
 
-        # aggregate over time and probe points -> per-group descriptor
-        probe_feat = probe_feat.mean(dim=3)                # [B, Q, G, C_per_group]
-        probe_feat = probe_feat.reshape(B, Q, -1).detach() # [B, Q, G*C_per_group = embed_dims]
-
-        # condition offset / scale prediction on both query state and fresh image content
-        cond_feat = torch.cat([query_feat, probe_feat], dim=-1)  # [B, Q, 2*embed_dims]
+        # Keep each group's five probe descriptors separate, then let a shared
+        # group head predict that group's offsets and scale weights.
+        probe_feat = probe_feat.detach().flatten(3)  # [B, Q, G, 5*C_per_group]
+        query_feat = query_feat[:, :, None, :].expand(B, Q, self.num_groups, -1)
+        cond_feat = torch.cat([query_feat, probe_feat], dim=-1)  # [B, Q, G, embed_dims + 5*C_per_group]
 
         # ==================== Main Sampling ====================
         # sampling offset of all frames
