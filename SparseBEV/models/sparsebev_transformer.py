@@ -12,6 +12,11 @@ from .sparsebev_sampling import sampling_4d, make_sample_points
 from .checkpoint import checkpoint as cp
 from .csrc.wrapper import MSMV_CUDA
 
+try:
+    from mamba_ssm import Mamba
+except Exception:
+    Mamba = None
+
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
@@ -324,7 +329,7 @@ class SparseBEVSampling(BaseModule):
 
 
 class FastSampleSelfAttention(nn.Module):
-    def __init__(self, embed_dims, num_heads=4, dropout=0.0, sdpa_batch_size=8192):
+    def __init__(self, embed_dims, num_heads=4, dropout=0.0):
         super().__init__()
         assert embed_dims % num_heads == 0
         self.embed_dims = embed_dims
@@ -332,7 +337,6 @@ class FastSampleSelfAttention(nn.Module):
         self.head_dims = embed_dims // num_heads
         self.dropout = dropout
         self.scale = self.head_dims ** -0.5
-        self.sdpa_batch_size = sdpa_batch_size
 
         self.qkv = nn.Linear(embed_dims, embed_dims * 3)
         self.proj = nn.Linear(embed_dims, embed_dims)
@@ -344,21 +348,10 @@ class FastSampleSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        if hasattr(F, 'scaled_dot_product_attention'):
-            dropout = self.dropout if self.training else 0.0
-            chunks = []
-            for q_i, k_i, v_i in zip(
-                q.split(self.sdpa_batch_size, dim=0),
-                k.split(self.sdpa_batch_size, dim=0),
-                v.split(self.sdpa_batch_size, dim=0)
-            ):
-                chunks.append(F.scaled_dot_product_attention(q_i, k_i, v_i, dropout_p=dropout))
-            x = torch.cat(chunks, dim=0)
-        else:
-            attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            attn = F.softmax(attn, dim=-1)
-            attn = F.dropout(attn, p=self.dropout, training=self.training)
-            x = torch.matmul(attn, v)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        attn = F.dropout(attn, p=self.dropout, training=self.training)
+        x = torch.matmul(attn, v)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj(x)
@@ -367,6 +360,16 @@ class FastSampleSelfAttention(nn.Module):
 class UniDirectionalSSM(nn.Module):
     def __init__(self, embed_dims):
         super().__init__()
+        self.use_mamba = Mamba is not None
+        if self.use_mamba:
+            self.ssm = Mamba(
+                d_model=embed_dims,
+                d_state=16,
+                d_conv=4,
+                expand=2,
+            )
+            return
+
         self.in_proj = nn.Linear(embed_dims, embed_dims * 2)
         self.x_proj = nn.Linear(embed_dims, embed_dims * 3)
         self.out_proj = nn.Linear(embed_dims, embed_dims)
@@ -376,6 +379,9 @@ class UniDirectionalSSM(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(embed_dims))
 
     def forward(self, x):
+        if self.use_mamba:
+            return self.ssm(x)
+
         B, T, C = x.shape
         u, gate = self.in_proj(x).chunk(2, dim=-1)
         u = F.silu(u)
@@ -384,14 +390,20 @@ class UniDirectionalSSM(nn.Module):
         dt = F.softplus(dt + self.dt_bias)
         A = -torch.exp(self.A_log).view(1, C)
 
-        state = x.new_zeros(B, C)
-        ys = []
-        for t in range(T):
-            decay = torch.exp(dt[:, t] * A)
-            state = decay * state + (1.0 - decay) * B_t[:, t] * u[:, t]
-            ys.append(C_t[:, t] * state + self.D * u[:, t])
+        dtype = u.dtype
+        dt = dt.float()
+        B_t = B_t.float()
+        C_t = C_t.float()
+        u = u.float()
+        A = A.float()
+        D = self.D.float()
 
-        y = torch.stack(ys, dim=1)
+        decay = torch.exp(dt * A[:, None, :])
+        state_input = (1.0 - decay) * B_t * u
+        decay_prefix = torch.cumprod(decay, dim=1)
+        state = decay_prefix * torch.cumsum(state_input / decay_prefix.clamp(min=1e-6), dim=1)
+        y = C_t * state + D.view(1, 1, C) * u
+        y = y.to(dtype)
         y = y * F.silu(gate)
         return self.out_proj(y)
 
