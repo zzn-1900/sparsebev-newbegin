@@ -324,7 +324,7 @@ class SparseBEVSampling(BaseModule):
 
 
 class FastSampleSelfAttention(nn.Module):
-    def __init__(self, embed_dims, num_heads=4, dropout=0.0):
+    def __init__(self, embed_dims, num_heads=4, dropout=0.0, sdpa_batch_size=8192):
         super().__init__()
         assert embed_dims % num_heads == 0
         self.embed_dims = embed_dims
@@ -332,6 +332,7 @@ class FastSampleSelfAttention(nn.Module):
         self.head_dims = embed_dims // num_heads
         self.dropout = dropout
         self.scale = self.head_dims ** -0.5
+        self.sdpa_batch_size = sdpa_batch_size
 
         self.qkv = nn.Linear(embed_dims, embed_dims * 3)
         self.proj = nn.Linear(embed_dims, embed_dims)
@@ -345,7 +346,14 @@ class FastSampleSelfAttention(nn.Module):
 
         if hasattr(F, 'scaled_dot_product_attention'):
             dropout = self.dropout if self.training else 0.0
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
+            chunks = []
+            for q_i, k_i, v_i in zip(
+                q.split(self.sdpa_batch_size, dim=0),
+                k.split(self.sdpa_batch_size, dim=0),
+                v.split(self.sdpa_batch_size, dim=0)
+            ):
+                chunks.append(F.scaled_dot_product_attention(q_i, k_i, v_i, dropout_p=dropout))
+            x = torch.cat(chunks, dim=0)
         else:
             attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
             attn = F.softmax(attn, dim=-1)
