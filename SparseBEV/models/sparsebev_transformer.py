@@ -12,11 +12,6 @@ from .sparsebev_sampling import sampling_4d, make_sample_points
 from .checkpoint import checkpoint as cp
 from .csrc.wrapper import MSMV_CUDA
 
-try:
-    from mamba_ssm import Mamba
-except Exception:
-    Mamba = None
-
 
 @TRANSFORMER.register_module()
 class SparseBEVTransformer(BaseModule):
@@ -360,16 +355,6 @@ class FastSampleSelfAttention(nn.Module):
 class UniDirectionalSSM(nn.Module):
     def __init__(self, embed_dims):
         super().__init__()
-        self.use_mamba = Mamba is not None
-        if self.use_mamba:
-            self.ssm = Mamba(
-                d_model=embed_dims,
-                d_state=16,
-                d_conv=4,
-                expand=2,
-            )
-            return
-
         self.in_proj = nn.Linear(embed_dims, embed_dims * 2)
         self.x_proj = nn.Linear(embed_dims, embed_dims * 3)
         self.out_proj = nn.Linear(embed_dims, embed_dims)
@@ -379,9 +364,6 @@ class UniDirectionalSSM(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(embed_dims))
 
     def forward(self, x):
-        if self.use_mamba:
-            return self.ssm(x)
-
         B, T, C = x.shape
         u, gate = self.in_proj(x).chunk(2, dim=-1)
         u = F.silu(u)
@@ -452,10 +434,7 @@ class SampleFeatureEnhancer(nn.Module):
 
     def forward(self, x):
         if self.training and x.requires_grad:
-            if self.temporal_ssm.use_mamba:
-                return cp(self.inner_forward, x, use_reentrant=True)
-            else:
-                return cp(self.inner_forward, x, use_reentrant=False)
+            return cp(self.inner_forward, x, use_reentrant=False)
         else:
             return self.inner_forward(x)
 
