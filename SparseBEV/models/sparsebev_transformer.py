@@ -86,9 +86,11 @@ class SparseBEVTransformerDecoder(BaseModule):
 
         for i in range(self.num_layers):
             DUMP.stage_count = i
+            enhance_sampling = i >= max(self.num_layers - 3, 0)
 
             query_feat, cls_score, bbox_pred = self.decoder_layer(
-                query_bbox, query_feat, mlvl_feats, attn_mask, img_metas
+                query_bbox, query_feat, mlvl_feats, attn_mask, img_metas,
+                enhance_sampling=enhance_sampling
             )
             query_bbox = bbox_pred.clone().detach()
 
@@ -121,6 +123,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         self.self_attn = SparseBEVSelfAttention(embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = SparseBEVSampling(embed_dims, num_frames=num_frames, num_groups=4, num_points=num_points, num_levels=num_levels, pc_range=pc_range)
+        self.sample_enhancer = SampleFeatureEnhancer(embed_dims // 4, num_frames=num_frames, num_points=num_points)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames, n_groups=4, out_points=128)
         self.ffn = FFN(embed_dims, feedforward_channels=512, ffn_drop=0.1)
 
@@ -147,6 +150,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
     def init_weights(self):
         self.self_attn.init_weights()
         self.sampling.init_weights()
+        self.sample_enhancer.init_weights()
         self.mixing.init_weights()
 
         bias_init = bias_init_with_prob(0.01)
@@ -159,7 +163,7 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         return torch.cat([xyz_new, bbox_delta[..., 3:]], dim=-1)
 
-    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
+    def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas, enhance_sampling=False):
         """
         query_bbox: [B, Q, 10] [cx, cy, cz, w, h, d, rot.sin, rot.cos, vx, vy]
         """
@@ -168,6 +172,8 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
 
         query_feat = self.norm1(self.self_attn(query_bbox, query_feat, attn_mask))
         sampled_feat = self.sampling(query_bbox, query_feat, mlvl_feats, img_metas)
+        if enhance_sampling:
+            sampled_feat = self.sample_enhancer(sampled_feat)
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
@@ -315,6 +321,120 @@ class SparseBEVSampling(BaseModule):
             return cp(self.inner_forward, query_bbox, query_feat, mlvl_feats, img_metas, use_reentrant=False)
         else:
             return self.inner_forward(query_bbox, query_feat, mlvl_feats, img_metas)
+
+
+class FastSampleSelfAttention(nn.Module):
+    def __init__(self, embed_dims, num_heads=4, dropout=0.0):
+        super().__init__()
+        assert embed_dims % num_heads == 0
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.head_dims = embed_dims // num_heads
+        self.dropout = dropout
+        self.scale = self.head_dims ** -0.5
+
+        self.qkv = nn.Linear(embed_dims, embed_dims * 3)
+        self.proj = nn.Linear(embed_dims, embed_dims)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dims)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        if hasattr(F, 'scaled_dot_product_attention'):
+            dropout = self.dropout if self.training else 0.0
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
+        else:
+            attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            attn = F.softmax(attn, dim=-1)
+            attn = F.dropout(attn, p=self.dropout, training=self.training)
+            x = torch.matmul(attn, v)
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        return self.proj(x)
+
+
+class UniDirectionalSSM(nn.Module):
+    def __init__(self, embed_dims):
+        super().__init__()
+        self.in_proj = nn.Linear(embed_dims, embed_dims * 2)
+        self.x_proj = nn.Linear(embed_dims, embed_dims * 3)
+        self.out_proj = nn.Linear(embed_dims, embed_dims)
+
+        self.A_log = nn.Parameter(torch.zeros(embed_dims))
+        self.D = nn.Parameter(torch.ones(embed_dims))
+        self.dt_bias = nn.Parameter(torch.zeros(embed_dims))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        u, gate = self.in_proj(x).chunk(2, dim=-1)
+        u = F.silu(u)
+
+        dt, B_t, C_t = self.x_proj(x).chunk(3, dim=-1)
+        dt = F.softplus(dt + self.dt_bias)
+        A = -torch.exp(self.A_log).view(1, C)
+
+        state = x.new_zeros(B, C)
+        ys = []
+        for t in range(T):
+            decay = torch.exp(dt[:, t] * A)
+            state = decay * state + (1.0 - decay) * B_t[:, t] * u[:, t]
+            ys.append(C_t[:, t] * state + self.D * u[:, t])
+
+        y = torch.stack(ys, dim=1)
+        y = y * F.silu(gate)
+        return self.out_proj(y)
+
+
+class SampleFeatureEnhancer(nn.Module):
+    def __init__(self, embed_dims, num_frames, num_points, num_heads=4):
+        super().__init__()
+        self.num_frames = num_frames
+        self.num_points = num_points
+
+        if embed_dims % num_heads != 0:
+            num_heads = 1
+
+        self.sample_norm = nn.LayerNorm(embed_dims)
+        self.sample_attn = FastSampleSelfAttention(embed_dims, num_heads=num_heads)
+        self.temporal_norm = nn.LayerNorm(embed_dims)
+        self.temporal_ssm = UniDirectionalSSM(embed_dims)
+
+    def init_weights(self):
+        pass
+
+    def inner_forward(self, x):
+        B, Q, G, TP, C = x.shape
+        assert TP == self.num_frames * self.num_points
+
+        x = x.reshape(B, Q, G, self.num_frames, self.num_points, C)
+
+        sample_x = self.sample_norm(x)
+        sample_x = sample_x.reshape(B * Q * G * self.num_frames, self.num_points, C)
+        sample_x = self.sample_attn(sample_x)
+        sample_x = sample_x.reshape(B, Q, G, self.num_frames, self.num_points, C)
+        x = x + sample_x
+
+        temporal_x = self.temporal_norm(x)
+        # Default frame order is current-to-history; scan history-to-current and restore.
+        temporal_x = temporal_x.flip(dims=[3])
+        temporal_x = temporal_x.permute(0, 1, 2, 4, 3, 5)
+        temporal_x = temporal_x.reshape(B * Q * G * self.num_points, self.num_frames, C)
+        temporal_x = self.temporal_ssm(temporal_x)
+        temporal_x = temporal_x.reshape(B, Q, G, self.num_points, self.num_frames, C)
+        temporal_x = temporal_x.permute(0, 1, 2, 4, 3, 5)
+        temporal_x = temporal_x.flip(dims=[3])
+        x = x + temporal_x
+
+        return x.reshape(B, Q, G, TP, C)
+
+    def forward(self, x):
+        if self.training and x.requires_grad:
+            return cp(self.inner_forward, x, use_reentrant=False)
+        else:
+            return self.inner_forward(x)
 
 
 class AdaptiveMixing(nn.Module):
