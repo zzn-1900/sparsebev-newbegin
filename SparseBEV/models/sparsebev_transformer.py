@@ -452,7 +452,10 @@ class SampleFeatureEnhancer(nn.Module):
 
     def forward(self, x):
         if self.training and x.requires_grad:
-            return cp(self.inner_forward, x, use_reentrant=False)
+            if self.temporal_ssm.use_mamba:
+                return cp(self.inner_forward, x, use_reentrant=True)
+            else:
+                return cp(self.inner_forward, x, use_reentrant=False)
         else:
             return self.inner_forward(x)
 
