@@ -19,6 +19,11 @@ class SparseBEVHead(DETRHead):
                  in_channels,
                  query_denoising=True,
                  query_denoising_groups=10,
+                 query_denoising_vae=True,
+                 query_denoising_vae_beta=0.01,
+                 query_denoising_yaw_noise_scale=0.05,
+                 query_denoising_vel_noise_scale=0.20,
+                 query_denoising_vel_noise_abs=0.0,
                  bbox_coder=None,
                  code_size=10,
                  code_weights=[1.0] * 10,
@@ -33,6 +38,7 @@ class SparseBEVHead(DETRHead):
         self.test_cfg = test_cfg
         self.fp16_enabled = False
         self.embed_dims = in_channels
+        self.dn_vae_enabled = query_denoising and query_denoising_vae
 
         super(SparseBEVHead, self).__init__(num_classes, in_channels, train_cfg=train_cfg, test_cfg=test_cfg, **kwargs)
 
@@ -42,13 +48,20 @@ class SparseBEVHead(DETRHead):
 
         self.dn_enabled = query_denoising
         self.dn_group_num = query_denoising_groups
+        self.dn_vae_enabled = query_denoising and query_denoising_vae
+        self.dn_vae_beta = query_denoising_vae_beta
         self.dn_weight = 1.0
         self.dn_bbox_noise_scale = 0.5
         self.dn_label_noise_scale = 0.5
+        self.dn_yaw_noise_scale = query_denoising_yaw_noise_scale
+        self.dn_vel_noise_scale = query_denoising_vel_noise_scale
+        self.dn_vel_noise_abs = query_denoising_vel_noise_abs
 
     def _init_layers(self):
         self.init_query_bbox = nn.Embedding(self.num_query, 10)  # (x, y, z, w, l, h, sin, cos, vx, vy)
         self.label_enc = nn.Embedding(self.num_classes + 1, self.embed_dims - 1)  # DAB-DETR
+        if self.dn_vae_enabled:
+            self._init_dn_vae_layers()
 
         nn.init.zeros_(self.init_query_bbox.weight[:, 2:3])
         nn.init.zeros_(self.init_query_bbox.weight[:, 8:10])
@@ -63,8 +76,43 @@ class SparseBEVHead(DETRHead):
         with torch.no_grad():
             self.init_query_bbox.weight[:, :2] = xy.reshape(-1, 2)  # [Q, 2]
 
+    def _init_dn_vae_layers(self):
+        label_dims = self.embed_dims - 1
+        self.dn_vae_encoder = nn.Sequential(
+            nn.Linear(self.code_size + label_dims, self.embed_dims),
+            nn.LayerNorm(self.embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.embed_dims, self.embed_dims),
+            nn.LayerNorm(self.embed_dims),
+            nn.ReLU(inplace=True),
+        )
+        self.dn_vae_mu = nn.Linear(self.embed_dims, label_dims)
+        self.dn_vae_logvar = nn.Linear(self.embed_dims, label_dims)
+        self.dn_vae_decoder = nn.Sequential(
+            nn.Linear(label_dims, self.embed_dims),
+            nn.LayerNorm(self.embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.embed_dims, label_dims),
+        )
+        nn.init.normal_(self.dn_vae_decoder[-1].weight, std=1e-3)
+        nn.init.zeros_(self.dn_vae_decoder[-1].bias)
+
     def init_weights(self):
         self.transformer.init_weights()
+
+    def sample_dn_vae_residual(self, noisy_bbox, label_feat):
+        vae_input = torch.cat([noisy_bbox, label_feat], dim=-1)
+        latent_feat = self.dn_vae_encoder(vae_input)
+        mu = self.dn_vae_mu(latent_feat)
+        logvar = self.dn_vae_logvar(latent_feat).clamp(min=-6.0, max=2.0)
+        std = torch.exp(0.5 * logvar)
+        z = mu + torch.randn_like(std) * std
+        residual = self.dn_vae_decoder(z)
+
+        label_feat = label_feat + residual
+        kl_loss = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+
+        return label_feat, kl_loss
 
     def forward(self, mlvl_feats, img_metas):
         query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
@@ -158,8 +206,16 @@ class SparseBEVHead(DETRHead):
                 wlh = known_bbox_expand[..., 3:6].clone()
                 rand_prob = torch.rand_like(known_bbox_expand) * 2 - 1.0
                 known_bbox_expand[..., 0:3] += torch.mul(rand_prob[..., 0:3], wlh / 2) * self.dn_bbox_noise_scale
+                known_bbox_expand[..., 6:7] += rand_prob[..., 6:7] * math.pi * self.dn_yaw_noise_scale
+
+                if known_bbox_expand.size(-1) > 8:
+                    vel = known_bbox_expand[..., 7:9]
+                    finite_vel = torch.isfinite(vel)
+                    vel_base = torch.nan_to_num(vel, nan=0.0)
+                    vel_scale = vel_base.abs() * self.dn_vel_noise_scale + self.dn_vel_noise_abs
+                    vel_noise = rand_prob[..., 7:9] * vel_scale
+                    known_bbox_expand[..., 7:9] = torch.where(finite_vel, vel + vel_noise, vel)
                 # known_bbox_expand[..., 3:6] += torch.mul(rand_prob[..., 3:6], wlh) * self.dn_bbox_noise_scale
-                # known_bbox_expand[..., 6:7] += torch.mul(rand_prob[..., 6:7], 3.14159) * self.dn_bbox_noise_scale
 
             known_bbox_expand = encode_bbox(known_bbox_expand, self.pc_range)
             known_bbox_expand[..., 0:3].clamp_(min=0.0, max=1.0)
@@ -173,6 +229,11 @@ class SparseBEVHead(DETRHead):
                 known_labels_expand.scatter_(0, chosen_indice, new_label)
 
             known_feat_expand = label_enc(known_labels_expand)
+            dn_vae_kl_loss = None
+            if self.dn_vae_enabled and known_feat_expand.numel() > 0:
+                known_feat_expand, dn_vae_kl_loss = self.sample_dn_vae_residual(
+                    known_bbox_expand, known_feat_expand)
+
             indicator1 = torch.ones([known_feat_expand.shape[0], 1], device=device)  # add dn part indicator
             known_feat_expand = torch.cat([known_feat_expand, indicator1], dim=1)
 
@@ -211,7 +272,8 @@ class SparseBEVHead(DETRHead):
                 'batch_idx': torch.as_tensor(batch_idx).long(),
                 'map_known_indice': torch.as_tensor(map_known_indice).long(),
                 'known_lbs_bboxes': (known_labels, known_bboxs),
-                'pad_size': dn_pad_size
+                'pad_size': dn_pad_size,
+                'dn_vae_kl_loss': dn_vae_kl_loss
             }
         else:
             input_query_bbox = init_query_bbox.repeat(batch_size, 1, 1)
@@ -289,6 +351,8 @@ class SparseBEVHead(DETRHead):
 
         loss_dict['loss_cls_dn'] = dn_losses_cls[-1]
         loss_dict['loss_bbox_dn'] = dn_losses_bbox[-1]
+        if 'dn_vae_kl_loss' in preds_dicts['dn_mask_dict'] and preds_dicts['dn_mask_dict']['dn_vae_kl_loss'] is not None:
+            loss_dict['loss_vae_kl_dn'] = self.dn_vae_beta * preds_dicts['dn_mask_dict']['dn_vae_kl_loss']
 
         num_dec_layer = 0
         for loss_cls_i, loss_bbox_i in zip(dn_losses_cls[:-1], dn_losses_bbox[:-1]):
