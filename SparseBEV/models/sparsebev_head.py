@@ -19,6 +19,9 @@ class SparseBEVHead(DETRHead):
                  in_channels,
                  query_denoising=True,
                  query_denoising_groups=10,
+                 num_fixed_query=None,
+                 num_dynamic_query=None,
+                 selector_grid_size=30,
                  bbox_coder=None,
                  code_size=10,
                  code_weights=[1.0] * 10,
@@ -33,6 +36,10 @@ class SparseBEVHead(DETRHead):
         self.test_cfg = test_cfg
         self.fp16_enabled = False
         self.embed_dims = in_channels
+        self.num_fixed_query = num_fixed_query
+        self.num_dynamic_query = num_dynamic_query
+        self.selector_grid_size = selector_grid_size
+        self.dynamic_query_enabled = num_fixed_query is not None and num_dynamic_query is not None
 
         super(SparseBEVHead, self).__init__(num_classes, in_channels, train_cfg=train_cfg, test_cfg=test_cfg, **kwargs)
 
@@ -46,32 +53,55 @@ class SparseBEVHead(DETRHead):
         self.dn_bbox_noise_scale = 0.5
         self.dn_label_noise_scale = 0.5
 
-    def _init_layers(self):
-        self.init_query_bbox = nn.Embedding(self.num_query, 10)  # (x, y, z, w, l, h, sin, cos, vx, vy)
-        self.label_enc = nn.Embedding(self.num_classes + 1, self.embed_dims - 1)  # DAB-DETR
+    def _init_query_embedding(self, embedding, grid_size):
+        nn.init.zeros_(embedding.weight[:, 2:3])
+        nn.init.zeros_(embedding.weight[:, 8:10])
+        nn.init.constant_(embedding.weight[:, 5:6], 1.5)
 
-        nn.init.zeros_(self.init_query_bbox.weight[:, 2:3])
-        nn.init.zeros_(self.init_query_bbox.weight[:, 8:10])
-        nn.init.constant_(self.init_query_bbox.weight[:, 5:6], 1.5)
-
-        grid_size = int(math.sqrt(self.num_query))
-        assert grid_size * grid_size == self.num_query
         x = y = torch.arange(grid_size)
         xx, yy = torch.meshgrid(x, y, indexing='ij')  # [0, grid_size - 1]
         xy = torch.cat([xx[..., None], yy[..., None]], dim=-1)
         xy = (xy + 0.5) / grid_size  # [0.5, grid_size - 0.5] / grid_size ~= (0, 1)
         with torch.no_grad():
-            self.init_query_bbox.weight[:, :2] = xy.reshape(-1, 2)  # [Q, 2]
+            embedding.weight[:, :2] = xy.reshape(-1, 2)  # [Q, 2]
+
+    def _init_layers(self):
+        if self.dynamic_query_enabled:
+            assert self.num_fixed_query + self.num_dynamic_query == self.num_query
+            fixed_grid_size = int(math.sqrt(self.num_fixed_query))
+            assert fixed_grid_size * fixed_grid_size == self.num_fixed_query
+            assert self.selector_grid_size * self.selector_grid_size >= self.num_dynamic_query
+            self.fixed_query_bbox = nn.Embedding(self.num_fixed_query, 10)
+            self.selector_query_bbox = nn.Embedding(self.selector_grid_size * self.selector_grid_size, 10)
+            self._init_query_embedding(self.fixed_query_bbox, fixed_grid_size)
+            self._init_query_embedding(self.selector_query_bbox, self.selector_grid_size)
+        else:
+            self.init_query_bbox = nn.Embedding(self.num_query, 10)  # (x, y, z, w, l, h, sin, cos, vx, vy)
+            grid_size = int(math.sqrt(self.num_query))
+            assert grid_size * grid_size == self.num_query
+            self._init_query_embedding(self.init_query_bbox, grid_size)
+
+        self.label_enc = nn.Embedding(self.num_classes + 1, self.embed_dims - 1)  # DAB-DETR
 
     def init_weights(self):
         self.transformer.init_weights()
 
-    def forward(self, mlvl_feats, img_metas):
-        query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
+    def forward(self, mlvl_feats, img_metas, selected_query_indices=None):
+        B = mlvl_feats[0].shape[0]
+        if self.dynamic_query_enabled:
+            assert selected_query_indices is not None
+            fixed_query_bbox = self.fixed_query_bbox.weight[None].expand(B, -1, -1)
+            selector_query_bbox = self.selector_query_bbox.weight[None].expand(B, -1, -1)
+            selected_query_indices = selected_query_indices.to(selector_query_bbox.device)
+            selected_query_indices = selected_query_indices[:, :self.num_dynamic_query]
+            gather_index = selected_query_indices[..., None].expand(-1, -1, selector_query_bbox.shape[-1])
+            dynamic_query_bbox = torch.gather(selector_query_bbox, 1, gather_index)
+            query_bbox = torch.cat([fixed_query_bbox, dynamic_query_bbox], dim=1)
+        else:
+            query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
         #query_bbox[..., :3] = query_bbox[..., :3].sigmoid()
 
         # query denoising
-        B = mlvl_feats[0].shape[0]
         query_bbox, query_feat, attn_mask, mask_dict = self.prepare_for_dn_input(B, query_bbox, self.label_enc, img_metas)
 
         cls_scores, bbox_preds = self.transformer(
@@ -122,9 +152,12 @@ class SparseBEVHead(DETRHead):
         #  - https://github.com/megvii-research/PETR/blob/main/projects/mmdet3d_plugin/models/dense_heads/petrv2_dnhead.py
 
         device = init_query_bbox.device
-        indicator0 = torch.zeros([self.num_query, 1], device=device)
-        init_query_feat = label_enc.weight[self.num_classes].repeat(self.num_query, 1)
+        num_query = init_query_bbox.shape[-2]
+        indicator0 = torch.zeros([num_query, 1], device=device)
+        init_query_feat = label_enc.weight[self.num_classes].repeat(num_query, 1)
         init_query_feat = torch.cat([init_query_feat, indicator0], dim=1)
+        if init_query_bbox.dim() == 2:
+            init_query_bbox = init_query_bbox[None].repeat(batch_size, 1, 1)
 
         if self.training and self.dn_enabled:
             targets = [{
@@ -179,9 +212,9 @@ class SparseBEVHead(DETRHead):
             # construct final query
             dn_single_pad = int(max(known_num))
             dn_pad_size = int(dn_single_pad * self.dn_group_num)
-            dn_query_bbox = torch.zeros([dn_pad_size, init_query_bbox.shape[-1]], device=device)
+            dn_query_bbox = torch.zeros([batch_size, dn_pad_size, init_query_bbox.shape[-1]], device=device)
             dn_query_feat = torch.zeros([dn_pad_size, self.embed_dims], device=device)
-            input_query_bbox = torch.cat([dn_query_bbox, init_query_bbox], dim=0).repeat(batch_size, 1, 1)
+            input_query_bbox = torch.cat([dn_query_bbox, init_query_bbox], dim=1)
             input_query_feat = torch.cat([dn_query_feat, init_query_feat], dim=0).repeat(batch_size, 1, 1)
 
             if len(known_num):
@@ -192,7 +225,7 @@ class SparseBEVHead(DETRHead):
                 input_query_bbox[known_bid.long(), map_known_indice] = known_bbox_expand
                 input_query_feat[(known_bid.long(), map_known_indice)] = known_feat_expand
 
-            total_size = dn_pad_size + self.num_query
+            total_size = dn_pad_size + num_query
             attn_mask = torch.ones([total_size, total_size], device=device) < 0
 
             # match query cannot see the reconstruct
@@ -214,7 +247,7 @@ class SparseBEVHead(DETRHead):
                 'pad_size': dn_pad_size
             }
         else:
-            input_query_bbox = init_query_bbox.repeat(batch_size, 1, 1)
+            input_query_bbox = init_query_bbox
             input_query_feat = init_query_feat.repeat(batch_size, 1, 1)
             attn_mask = None
             mask_dict = None

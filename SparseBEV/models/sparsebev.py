@@ -1,4 +1,6 @@
 import queue
+import glob
+import os
 import torch
 import numpy as np
 from mmcv.runner import force_fp32, auto_fp16
@@ -8,6 +10,7 @@ from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from .utils import GridMask, pad_multiple, GpuPhotoMetricDistortion
+from .query_selector import QuerySelector
 
 
 @DETECTORS.register_module()
@@ -15,6 +18,8 @@ class SparseBEV(MVXTwoStageDetector):
     def __init__(self,
                  data_aug=None,
                  stop_prev_grad=0,
+                 query_selector=None,
+                 query_selector_pretrained=None,
                  pts_voxel_layer=None,
                  pts_voxel_encoder=None,
                  pts_middle_encoder=None,
@@ -39,9 +44,41 @@ class SparseBEV(MVXTwoStageDetector):
         self.color_aug = GpuPhotoMetricDistortion()
         self.grid_mask = GridMask(ratio=0.5, prob=0.7)
         self.use_grid_mask = True
+        self.query_selector = QuerySelector(**query_selector) if query_selector is not None else None
+        if query_selector_pretrained is not None:
+            self.load_query_selector(query_selector_pretrained)
 
         self.memory = {}
         self.queue = queue.Queue()
+
+    def load_query_selector(self, checkpoint):
+        if checkpoint == 'auto':
+            candidates = glob.glob(os.path.join('outputs', 'QuerySelectorPretrain', '**', 'latest.pth'), recursive=True)
+            if len(candidates) == 0:
+                raise RuntimeError('No query selector checkpoint found under outputs/QuerySelectorPretrain/**/latest.pth')
+            checkpoint = max(candidates, key=os.path.getmtime)
+
+        checkpoint_path = checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+
+        selector_state_dict = {}
+        img_neck_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                key = key[7:]
+            if key.startswith('selector.'):
+                selector_state_dict[key] = value
+            elif key.startswith('query_selector.'):
+                selector_state_dict[key[len('query_selector.'):]] = value
+            elif key.startswith('img_neck.'):
+                img_neck_state_dict[key[len('img_neck.'):]] = value
+
+        if len(selector_state_dict) == 0:
+            raise RuntimeError('No query selector weights found in %s' % checkpoint_path)
+        self.query_selector.load_state_dict(selector_state_dict, strict=False)
+        if len(img_neck_state_dict) > 0 and self.with_img_neck:
+            self.img_neck.load_state_dict(img_neck_state_dict, strict=False)
 
     @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_img_feat(self, img):
@@ -135,7 +172,8 @@ class SparseBEV(MVXTwoStageDetector):
                           gt_bboxes_3d,
                           gt_labels_3d,
                           img_metas,
-                          gt_bboxes_ignore=None):
+                          gt_bboxes_ignore=None,
+                          selected_query_indices=None):
         """Forward function for point cloud branch.
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -149,7 +187,7 @@ class SparseBEV(MVXTwoStageDetector):
         Returns:
             dict: Losses of each branch.
         """
-        outs = self.pts_bbox_head(pts_feats, img_metas)
+        outs = self.pts_bbox_head(pts_feats, img_metas, selected_query_indices=selected_query_indices)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
         losses = self.pts_bbox_head.loss(*loss_inputs)
 
@@ -207,12 +245,20 @@ class SparseBEV(MVXTwoStageDetector):
             dict: Losses of different branches.
         """
         img_feats = self.extract_feat(img, img_metas)
+        selected_query_indices = None
+        selector_losses = {}
+        if self.query_selector is not None:
+            selected_query_indices, selector_losses = self.query_selector.forward_train(
+                img_feats, img_metas, gt_bboxes_3d)
 
         for i in range(len(img_metas)):
             img_metas[i]['gt_bboxes_3d'] = gt_bboxes_3d[i]
             img_metas[i]['gt_labels_3d'] = gt_labels_3d[i]
 
-        losses = self.forward_pts_train(img_feats, gt_bboxes_3d, gt_labels_3d, img_metas, gt_bboxes_ignore)
+        losses = self.forward_pts_train(
+            img_feats, gt_bboxes_3d, gt_labels_3d, img_metas, gt_bboxes_ignore,
+            selected_query_indices=selected_query_indices)
+        losses.update(selector_losses)
 
         return losses
 
@@ -224,8 +270,8 @@ class SparseBEV(MVXTwoStageDetector):
         img = [img] if img is None else img
         return self.simple_test(img_metas[0], img[0], **kwargs)
 
-    def simple_test_pts(self, x, img_metas, rescale=False):
-        outs = self.pts_bbox_head(x, img_metas)
+    def simple_test_pts(self, x, img_metas, rescale=False, selected_query_indices=None):
+        outs = self.pts_bbox_head(x, img_metas, selected_query_indices=selected_query_indices)
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas[0], rescale=rescale)
 
         bbox_results = [
@@ -244,9 +290,14 @@ class SparseBEV(MVXTwoStageDetector):
 
     def simple_test_offline(self, img_metas, img=None, rescale=False):
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        selected_query_indices = None
+        if self.query_selector is not None:
+            selected_query_indices = self.query_selector.forward_test(img_feats, img_metas)
 
         bbox_list = [dict() for _ in range(len(img_metas))]
-        bbox_pts = self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        bbox_pts = self.simple_test_pts(
+            img_feats, img_metas, rescale=rescale,
+            selected_query_indices=selected_query_indices)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
 
@@ -311,10 +362,15 @@ class SparseBEV(MVXTwoStageDetector):
         img_feats = img_feats_reorganized
         img_metas = img_metas_reorganized
         img_feats = cast_tensor_type(img_feats, torch.half, torch.float32)
+        selected_query_indices = None
+        if self.query_selector is not None:
+            selected_query_indices = self.query_selector.forward_test(img_feats, img_metas)
 
         # run detector
         bbox_list = [dict() for _ in range(1)]
-        bbox_pts = self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        bbox_pts = self.simple_test_pts(
+            img_feats, img_metas, rescale=rescale,
+            selected_query_indices=selected_query_indices)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
 
