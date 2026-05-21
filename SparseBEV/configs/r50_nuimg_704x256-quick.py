@@ -17,8 +17,8 @@ class_names = [
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
-point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 voxel_size = [0.2, 0.2, 8]
+point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 
 # arch config
 embed_dims = 256
@@ -63,7 +63,7 @@ model = dict(
         pc_range=point_cloud_range,
         detach_feats=True,
         loss_weight=1.0,
-        vis_interval=500,
+        vis_interval=20,
         vis_dir='outputs/query_selector_full/vis'),
     query_selector_pretrained='auto',
     img_backbone=img_backbone,
@@ -170,7 +170,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=dataset_root,
-        ann_file=dataset_root + 'nuscenes_infos_train_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_train_mini_sweep.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -180,7 +180,7 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=dataset_root,
-        ann_file=dataset_root + 'nuscenes_infos_val_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_val_mini_sweep.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -189,7 +189,7 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=dataset_root,
-        ann_file=dataset_root + 'nuscenes_infos_test_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_test_mini_sweep.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -221,7 +221,7 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3
 )
-total_epochs = 24
+total_epochs = 5
 batch_size = 8
 
 # load pretrained weights
@@ -238,13 +238,13 @@ checkpoint_config = dict(interval=1, max_keep_ckpts=1)
 log_config = dict(
     interval=1,
     hooks=[
-        dict(type='MyTextLoggerHook', interval=50, reset_flag=True),
-        dict(type='MyTensorboardLoggerHook', interval=50, reset_flag=True)
+        dict(type='MyTextLoggerHook', interval=1, reset_flag=True),
+        dict(type='MyTensorboardLoggerHook', interval=500, reset_flag=True)
     ]
 )
 
 # evaluation
-eval_config = dict(interval=1)
+eval_config = dict(interval=total_epochs)
 
 # other flags
 debug = False
