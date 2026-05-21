@@ -1,9 +1,44 @@
 _base_ = ['./r50_nuimg_704x256.py']
 
+class_names = [
+    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+]
+
+point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 num_levels = 4
 embed_dims = 256
 num_query = 900
 grid_size = 30
+
+img_backbone = dict(
+    type='ResNet',
+    depth=50,
+    num_stages=4,
+    out_indices=(0, 1, 2, 3),
+    frozen_stages=1,
+    norm_cfg=dict(type='BN2d', requires_grad=True),
+    norm_eval=True,
+    style='pytorch',
+    with_cp=True)
+img_neck = dict(
+    type='FPN',
+    in_channels=[256, 512, 1024, 2048],
+    out_channels=embed_dims,
+    num_outs=num_levels)
+img_norm_cfg = dict(
+    mean=[123.675, 116.280, 103.530],
+    std=[58.395, 57.120, 57.375],
+    to_rgb=True)
+
+ida_aug_conf = {
+    'resize_lim': (0.38, 0.55),
+    'final_dim': (256, 704),
+    'bot_pct_lim': (0.0, 0.0),
+    'rot_lim': (0.0, 0.0),
+    'H': 900, 'W': 1600,
+    'rand_flip': True,
+}
 
 model = dict(
     _delete_=True,
