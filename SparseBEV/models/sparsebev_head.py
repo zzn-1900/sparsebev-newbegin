@@ -68,12 +68,14 @@ class SparseBEVHead(DETRHead):
     def _init_layers(self):
         if self.dynamic_query_enabled:
             assert self.num_fixed_query + self.num_dynamic_query == self.num_query
-            fixed_grid_size = int(math.sqrt(self.num_fixed_query))
-            assert fixed_grid_size * fixed_grid_size == self.num_fixed_query
+            if self.num_fixed_query > 0:
+                fixed_grid_size = int(math.sqrt(self.num_fixed_query))
+                assert fixed_grid_size * fixed_grid_size == self.num_fixed_query
             assert self.selector_grid_size * self.selector_grid_size >= self.num_dynamic_query
-            self.fixed_query_bbox = nn.Embedding(self.num_fixed_query, 10)
+            self.fixed_query_bbox = nn.Embedding(self.num_fixed_query, 10) if self.num_fixed_query > 0 else None
             self.selector_query_bbox = nn.Embedding(self.selector_grid_size * self.selector_grid_size, 10)
-            self._init_query_embedding(self.fixed_query_bbox, fixed_grid_size)
+            if self.fixed_query_bbox is not None:
+                self._init_query_embedding(self.fixed_query_bbox, fixed_grid_size)
             self._init_query_embedding(self.selector_query_bbox, self.selector_grid_size)
         else:
             self.init_query_bbox = nn.Embedding(self.num_query, 10)  # (x, y, z, w, l, h, sin, cos, vx, vy)
@@ -90,13 +92,16 @@ class SparseBEVHead(DETRHead):
         B = mlvl_feats[0].shape[0]
         if self.dynamic_query_enabled:
             assert selected_query_indices is not None
-            fixed_query_bbox = self.fixed_query_bbox.weight[None].expand(B, -1, -1)
             selector_query_bbox = self.selector_query_bbox.weight[None].expand(B, -1, -1)
             selected_query_indices = selected_query_indices.to(selector_query_bbox.device)
             selected_query_indices = selected_query_indices[:, :self.num_dynamic_query]
             gather_index = selected_query_indices[..., None].expand(-1, -1, selector_query_bbox.shape[-1])
             dynamic_query_bbox = torch.gather(selector_query_bbox, 1, gather_index)
-            query_bbox = torch.cat([fixed_query_bbox, dynamic_query_bbox], dim=1)
+            if self.fixed_query_bbox is not None:
+                fixed_query_bbox = self.fixed_query_bbox.weight[None].expand(B, -1, -1)
+                query_bbox = torch.cat([fixed_query_bbox, dynamic_query_bbox], dim=1)
+            else:
+                query_bbox = dynamic_query_bbox
         else:
             query_bbox = self.init_query_bbox.weight.clone()  # [Q, 10]
         #query_bbox[..., :3] = query_bbox[..., :3].sigmoid()
